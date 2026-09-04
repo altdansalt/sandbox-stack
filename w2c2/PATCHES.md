@@ -15,3 +15,11 @@ Upstream commit: see UPSTREAM. Diff against upstream: `diff -ru ~/src/w2c2/w2c2 
    musl smoothsort: not). Now a total order.
 5. `main.c` `cleanImplementationFiles`: without glob/Win32 the function is a no-op
    instead of `#error` (the wasm guest has no directory listing).
+6. `c.c` (codex review 1): `memory.init` is emitted as `MEMORY_INIT(mem, dest, dN, dN_len, src, len)` and
+   the runtime checks `src+len <= dN_len` as well as the destination; every data segment gets a
+   `U32 dN_len` variable and `data.drop` (previously "unimplemented") sets it to 0.
+7. `c.c` (codex review 1): element-segment initialisation emits `wasm_table_init(&table, offset, count)`
+   (traps unless the whole range fits) before the writes, and records a canonical function type id in
+   `table.types[]` for each entry. `call_indirect` passes the expected canonical id:
+   `TF(table, index, type_id, ctype)`; the runtime traps on mismatch. Canonical id = index of the first
+   structurally identical entry of the type section (`wasmCanonicalFunctionTypeIndex`).

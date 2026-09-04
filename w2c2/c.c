@@ -752,6 +752,46 @@ wasmCWriteParameters(
     return true;
 }
 
+/* patched: canonical function type id = index of the first structurally equal type */
+static
+U32
+wasmCanonicalFunctionTypeIndex(
+    const WasmModule* module,
+    const U32 functionTypeIndex
+) {
+    const WasmFunctionType t = module->functionTypes.functionTypes[functionTypeIndex];
+    U32 j = 0;
+    for (; j < functionTypeIndex; j++) {
+        const WasmFunctionType u = module->functionTypes.functionTypes[j];
+        U32 k = 0;
+        bool same = u.parameterCount == t.parameterCount && u.resultCount == t.resultCount;
+        for (; same && k < t.parameterCount; k++) {
+            same = u.parameterTypes[k] == t.parameterTypes[k];
+        }
+        for (k = 0; same && k < t.resultCount; k++) {
+            same = u.resultTypes[k] == t.resultTypes[k];
+        }
+        if (same) {
+            return j;
+        }
+    }
+    return functionTypeIndex;
+}
+
+static
+U32
+wasmCanonicalFunctionTypeIndexOfFunction(
+    const WasmModule* module,
+    U32 functionIndex
+) {
+    const U32 functionImportCount = assertSizeU32(module->functionImports.length);
+    if (functionIndex < functionImportCount) {
+        return wasmCanonicalFunctionTypeIndex(module, module->functionImports.imports[functionIndex].functionTypeIndex);
+    }
+    functionIndex -= functionImportCount;
+    return wasmCanonicalFunctionTypeIndex(module, module->functions.functions[functionIndex].functionTypeIndex);
+}
+
 static
 bool
 WARN_UNUSED_RESULT
@@ -799,6 +839,10 @@ wasmCWriteCallIndirectExpr(
             ))
         }
 
+        MUST (wasmCWriteComma(writer))
+        /* patched: expected canonical function type id, checked by the runtime */
+        MUST (stringBuilderAppendU32(writer->builder, wasmCanonicalFunctionTypeIndex(writer->module, instruction.functionTypeIndex)))
+        MUST (wasmCWriteChar(writer, 'U'))
         MUST (wasmCWriteComma(writer))
         MUST (wasmCWrite(writer, wasmCGetReturnType(functionType)))
         MUST (wasmCWrite(writer, " (*)"))
@@ -1526,7 +1570,8 @@ wasmCWriteMemoryInitExpr(
         const U32 stackIndex2 = wasmTypeStackGetTopIndex(writer->typeStack, 2);
 
         MUST (wasmCWriteIndent(writer))
-        MUST (wasmCWrite(writer, "LOAD_DATA("))
+        /* patched: MEMORY_INIT(mem, dest, segment, segment_len, src, len); the runtime checks both ranges */
+        MUST (wasmCWrite(writer, "MEMORY_INIT("))
         MUST (wasmCWriteStringMemoryUse(
             writer->builder,
             writer->module,
@@ -1542,7 +1587,10 @@ wasmCWriteMemoryInitExpr(
         MUST (wasmCWriteComma(writer))
         /* TODO: add support for multiple modules */
         MUST (wasmCWriteStringDataSegmentName(writer->builder, instruction.dataSegmentIndex))
-        MUST (wasmCWriteChar(writer, '+'))
+        MUST (wasmCWriteComma(writer))
+        MUST (wasmCWriteStringDataSegmentName(writer->builder, instruction.dataSegmentIndex))
+        MUST (wasmCWrite(writer, "_len"))
+        MUST (wasmCWriteComma(writer))
         MUST (wasmCWriteStringStackName(
             writer->builder,
             stackIndex1,
@@ -3670,12 +3718,12 @@ wasmCWriteFunctionCode(
                         U32 dataIndex = 0;
                         MUST (leb128ReadU32(writer->code, &dataIndex) > 0)
 
-                        /* TODO */
-                        fprintf(
-                            stderr,
-                            "w2c2: unimplemented opcode: %s\n",
-                            wasmMiscOpcodeDescription(miscOpcode)
-                        );
+                        /* patched: data.drop sets the segment length to zero */
+                        if (!writer->ignore) {
+                            MUST (wasmCWriteIndent(writer))
+                            MUST (wasmCWriteStringDataSegmentName(writer->builder, dataIndex))
+                            MUST (wasmCWrite(writer, "_len=0;\n"))
+                        }
 
                         break;
                     }
@@ -5167,7 +5215,11 @@ wasmCWriteDataSegments(
                 if (byteCount > DATA_SEGMENT_CHUNK_LENGTH) {
                     fputc('\n', file);
                 }
-                fputs("};\n\n", file);
+                fputs("};\n", file);
+                /* patched: current segment length (zeroed by data.drop) */
+                fputs("U32 ", file);
+                wasmCWriteFileDataSegmentName(file, dataSegmentIndex);
+                fprintf(file, "_len=%lu;\n\n", (unsigned long) byteCount);
             }
             break;
         }
@@ -5193,6 +5245,16 @@ wasmCWriteDataSegments(
             }
             if (writtenCount > 0) {
                 fputs(";\n", file);
+            }
+            /* patched: current segment length (zeroed by data.drop) */
+            for (dataSegmentIndex = 0; dataSegmentIndex < dataSegmentCount; dataSegmentIndex++) {
+                const WasmDataSegment dataSegment = module->dataSegments.dataSegments[dataSegmentIndex];
+                if (!dataSegment.passive) {
+                    continue;
+                }
+                fputs("U32 ", file);
+                wasmCWriteFileDataSegmentName(file, dataSegmentIndex);
+                fprintf(file, "_len=%lu;\n", (unsigned long) dataSegment.bytes.length);
             }
             break;
         }
@@ -5610,6 +5672,14 @@ wasmCWriteInitTables(
                 }
                 fputs(";\n", file);
 
+                /* patched: bounds-check the whole segment before writing; record type ids */
+                if (pretty) {
+                    fputs(indentation, file);
+                }
+                fputs("wasm_table_init(", file);
+                wasmCWriteFileTableUse(file, module, elementSegment.tableIndex, true);
+                fprintf(file, ", offset, %uU);\n", elementSegment.functionIndexCount);
+
                 {
                     U32 functionIndexIndex = 0;
                     for (; functionIndexIndex < elementSegment.functionIndexCount; functionIndexIndex++) {
@@ -5625,6 +5695,15 @@ wasmCWriteInitTables(
                         }
                         wasmCWriteFileFunctionUse(file, module, moduleName, functionIndex, true, multipleModules);
                         fputs(";\n", file);
+                        if (pretty) {
+                            fputs(indentation, file);
+                        }
+                        wasmCWriteFileTableUse(file, module, elementSegment.tableIndex, false);
+                        if (pretty) {
+                            fprintf(file, ".types[offset + %u] = %uU;\n", functionIndexIndex, wasmCanonicalFunctionTypeIndexOfFunction(module, functionIndex));
+                        } else {
+                            fprintf(file, ".types[offset+%u]=%uU;\n", functionIndexIndex, wasmCanonicalFunctionTypeIndexOfFunction(module, functionIndex));
+                        }
                     }
                 }
             }

@@ -12,6 +12,7 @@
 U8 wasm_arena[(unsigned long)ARENA_PAGES * WASM_PAGE_SIZE];
 const U32 wasm_arena_pages = ARENA_PAGES;
 wasmFunc wasm_table_arena[TABLE_SIZE];
+U32 wasm_table_types_arena[TABLE_SIZE];
 const U32 wasm_table_arena_size = TABLE_SIZE;
 
 enum { SYS_read = 0, SYS_write = 1, SYS_exit = 60, SYS_prctl = 157, PR_SET_SECCOMP = 22, SECCOMP_MODE_STRICT = 1 };

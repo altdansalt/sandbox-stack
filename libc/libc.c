@@ -26,7 +26,9 @@ void* malloc(size_t n) {
     return (void*)(cur + 16);
 }
 void* calloc(size_t n, size_t m) {
-    void* p = malloc(n * m);
+    void* p;
+    if (m && n > (size_t)-1 / m) return NULL;
+    p = malloc(n * m);
     if (p) memset(p, 0, n * m);
     return p;
 }

@@ -2,7 +2,9 @@
  * Replaces upstream w2c2_base.h. Differences from upstream:
  *  - every load/store is software bounds-checked against the current memory size
  *  - memory lives in one static arena; memory.grow only moves a limit, never allocates
- *  - call_indirect checks table index bounds and null entries (no signature check)
+ *  - call_indirect checks table index bounds, null entries and the canonical signature id
+ *  - memory.init / data.drop and element-segment initialisation are range-checked
+ *  - memory/table maxima are clamped to the host arenas; arenas must stay below 65536 pages
  *  - no libc includes: the host provides memcpy/memmove/memset and trap()
  *  - no threads, atomics, big-endian, WASI, or debug support
  * Only wasm32, little-endian hosts. */
@@ -49,7 +51,8 @@ typedef enum Trap {
     trapAllocationFailed,
     trapOutOfBoundsMemory,
     trapOutOfBoundsTable,
-    trapNullFunction
+    trapNullFunction,
+    trapIndirectCallTypeMismatch
 } Trap;
 extern void trap(Trap) NORETURN;
 #define TRAP(x) (trap(x), 0)
@@ -107,7 +110,8 @@ extern const U32 wasm_arena_pages;
 static wasmMemory wasm_memory0;
 
 static W2C2_INLINE wasmMemory* wasmMemoryAllocate(U32 initialPages, U32 maxPages, bool shared) {
-    if (shared || wasm_memory0.data || maxPages > wasm_arena_pages || initialPages > maxPages) trap(trapAllocationFailed);
+    if (maxPages > wasm_arena_pages) maxPages = wasm_arena_pages; /* growth past the arena fails with -1 */
+    if (shared || wasm_memory0.data || wasm_arena_pages >= 65536 || initialPages > maxPages) trap(trapAllocationFailed);
     wasm_memory0.data = wasm_arena;
     wasm_memory0.pages = initialPages;
     wasm_memory0.size = initialPages * WASM_PAGE_SIZE;
@@ -135,6 +139,13 @@ static W2C2_INLINE void wasmMemoryFill(const wasmMemory* m, U32 da, U32 v, U32 n
     memset(m->data + da, (int)v, n);
 }
 #define LOAD_DATA(m, o, i, s) (wasm_check(&(m), (o), (s)), memcpy(&((m).data[o]), (i), (s)))
+/* memory.init: both the destination range and the source range within the (possibly dropped) segment are checked */
+static W2C2_INLINE void wasm_memory_init(const wasmMemory* m, U32 dest, const U8* seg, U32 seg_len, U32 src, U32 n) {
+    if ((U64)src + n > seg_len) trap(trapOutOfBoundsMemory);
+    wasm_check(m, dest, n);
+    memcpy(m->data + dest, seg + src, n);
+}
+#define MEMORY_INIT(m, o, seg, seg_len, src, n) wasm_memory_init(&(m), (o), (seg), (seg_len), (src), (n))
 
 #define DEFINE_LOAD(name, t1, t2, t3) \
     static W2C2_INLINE t3 name(wasmMemory* m, WasmPtr a) { t1 r; wasm_check(m, a, sizeof r); memcpy(&r, &m->data[a], sizeof r); return (t3)(t2)r; }
@@ -166,20 +177,27 @@ DEFINE_STORE(i64_store32, U32, U64)
 
 /* tables: one static array, sized by the host */
 typedef void (*wasmFunc)(void);
-typedef struct wasmTable { wasmFunc* data; U32 size, maxSize; } wasmTable;
+typedef struct wasmTable { wasmFunc* data; U32* types; U32 size, maxSize; } wasmTable;
 extern wasmFunc wasm_table_arena[];
+extern U32 wasm_table_types_arena[];
 extern const U32 wasm_table_arena_size;
 static W2C2_INLINE void wasmTableAllocate(wasmTable* t, U32 size, U32 maxSize) {
-    if (t->data || size > wasm_table_arena_size) trap(trapAllocationFailed);
-    t->data = wasm_table_arena; t->size = size; t->maxSize = maxSize;
+    if (maxSize > wasm_table_arena_size) maxSize = wasm_table_arena_size;
+    if (t->data || size > maxSize) trap(trapAllocationFailed);
+    t->data = wasm_table_arena; t->types = wasm_table_types_arena; t->size = size; t->maxSize = maxSize;
 }
 static W2C2_INLINE void wasmTableFree(wasmTable* t) { (void)t; }
-static W2C2_INLINE wasmFunc wasm_table_get(const wasmTable* t, U32 i) {
+/* element segment init: the whole [offset, offset+count) range must fit */
+static W2C2_INLINE void wasm_table_init(const wasmTable* t, U32 offset, U32 count) {
+    if ((U64)offset + count > t->size) trap(trapOutOfBoundsTable);
+}
+static W2C2_INLINE wasmFunc wasm_table_get(const wasmTable* t, U32 i, U32 expected_type) {
     if (i >= t->size) trap(trapOutOfBoundsTable);
     if (!t->data[i]) trap(trapNullFunction);
+    if (t->types[i] != expected_type) trap(trapIndirectCallTypeMismatch);
     return t->data[i];
 }
-#define TF(table, index, t) ((t)wasm_table_get(&(table), (index)))
+#define TF(table, index, type_id, t) ((t)wasm_table_get(&(table), (index), (type_id)))
 
 typedef struct wasmFuncExport { wasmFunc func; char* name; } wasmFuncExport;
 typedef struct wasmModuleInstance {

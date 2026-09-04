@@ -53,3 +53,4 @@ build/w2c2/sandbox: build/w2c2.wasm host/main.c rt/w2c2_base.h build/w2c2-native
 	cp build/w2c2.wasm build/w2c2/guest.wasm
 	./build/w2c2-native build/w2c2/guest.wasm build/w2c2/guest.c
 	$(TCC) -nostdlib -static -nostdinc -Irt -Ibuild/w2c2 -DARENA_PAGES=4096 -o $@ host/main.c build/w2c2/guest.c
+include tests/tests.mk

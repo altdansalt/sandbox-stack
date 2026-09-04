@@ -92,3 +92,51 @@ Notes on what is counted:
 | **total** | | **39651** | | **421143** | |
 
 Delta vs Experiment 1: +316 libc lines (+4270 tokens); w2c2 core shrank slightly from the float-printing removal. Total 421,143 tokens; tcc is 74.8%.
+
+## Codex review 1: findings and fixes
+
+A read-only codex review (`reviews/codex-review-1.md`) audited the trust boundary. It confirmed the seccomp confinement (static binaries, one `syscall` site in `sys3`, only read/write/exit after `prctl`) and found memory-safety holes in the *generated-code* path — w2c2's emitter bypassed the runtime's checked accessors for three wasm constructs. All fixes below are verified by adversarial modules in `tests/` (`make test`).
+
+### Findings and what changed
+| # | sev | finding | fix |
+|---|---|---|---|
+| 1 | critical | `memory.init` checked the destination but not the source range within the data segment → read past the segment array into host memory, exfiltratable via `env.write` | emitter now writes `MEMORY_INIT(mem,dest,dN,dN_len,src,len)`; runtime `wasm_memory_init` checks `(U64)src+len<=dN_len` and the destination (`w2c2/c.c`, `rt/w2c2_base.h`). Each segment gets a `U32 dN_len`; `data.drop` (was "unimplemented") sets it to 0. |
+| 2 | critical | active element segments emitted `t0.data[offset+n]=&fN;` with no bounds check → function-pointer writes outside the table arena | emitter now emits `wasm_table_init(&t0,offset,count)` (traps `trapOutOfBoundsTable` unless `(U64)offset+count<=size`) before the writes (`w2c2/c.c`, `rt/w2c2_base.h`) |
+| 3 | high | `call_indirect` had no signature check → call through an incompatible C function-pointer type (UB) | every wasm function type gets a canonical id (first structurally-equal type-section entry); the table carries a parallel `U32 types[]`; each `TF(table,index,type_id,ctype)` traps `trapIndirectCallTypeMismatch` on mismatch (`w2c2/c.c`, `rt/w2c2_base.h`, `host/main.c` adds `wasm_table_types_arena[]`) |
+| 4 | medium | `wasmTableAllocate` accepted `maxSize` larger than the arena | clamp `maxSize` to the arena and trap if `size>maxSize` |
+| 5 | medium | `size = pages*65536` wraps to 0 at 65536 pages (U32) | `wasmMemoryAllocate` traps if `wasm_arena_pages>=65536`; documented |
+| 6 | high | `calloc(n,m)` multiplication overflow | returns NULL when `n>SIZE_MAX/m` (`libc/libc.c`) |
+| 7 | high | `fopen`/`fwrite` discarded failed `realloc`, continued with NULL; capacity doubling could wrap | new `grow()` helper: overflow-checked, allocation failure is a fatal `_exit`, never silent (`libc/stdio.c`) |
+| 8 | medium | `fread(sz=0)` divided by zero; `fseek` accepted invalid whence / negative positions (later underflow in `fread`) | `fread` returns 0 for `sz==0||n==0||pos>=len`; `fseek` rejects bad whence and negative results (`libc/stdio.c`) |
+| 9 | low | `printf` put the sign after zero-padding (`%05d` of -12 → `00-12`) | sign emitted before zero padding; verified `-0012` natively (`libc/stdio.c`) |
+
+### Adversarial modules (`tests/mkwasm.py`, hand-assembled wasm; `make test`)
+| module | attack | sandbox result | wazero control |
+|---|---|---|---|
+| positive | write "ok\n", exit 0 | exit 0 | exit 0 |
+| oob_load | `i32.load` at 0x7fffff00 | trap 6 (OOB memory), exit 106 | traps (exit 3) |
+| mem_init_oob | `memory.init` src=0 len=100 from a 3-byte passive segment | trap 6, exit 106 | traps (exit 3) |
+| elem_oob | active element segment at offset 5 into a 2-slot table | trap 7 (OOB table), exit 107 | **exit 0 — accepts it** |
+| callind_typemismatch | `call_indirect` as `(i32,i32,i32)->i32` through a `(i32)->i32` entry | trap 9 (type mismatch), exit 109 | traps (exit 3) |
+
+Note on `elem_oob`: wazero v1.9.0 rejects an out-of-bounds active *data* segment (verified separately: "data[0]: out of bounds memory access") but silently accepts an out-of-bounds active *element* segment, even with a declared table max. So for this one case the sandbox is **stricter** than the wazero control. The module is kept in the suite as a sandbox trap check; w2c2 accepts and translates it (it does not validate segment bounds itself).
+
+### Fixpoint re-verified after all fixes
+Regenerated from scratch (`rm -rf build/cmp build/w2c2 build/gen2 ...`): sandboxed w2c2 translating rot13.wasm and w2c2.wasm is byte-identical to native w2c2 (same patched source) and to the wazero control; the gen-2 binary (tcc-compiling the C the sandboxed w2c2 emitted) is byte-identical to gen-1 and produces identical output. `strace -c`: 1 prctl, 2 read, 19 write, exit — unchanged.
+
+### Not fixed (deliberate), with reasons
+- **Effective-address wrap semantics** (`base+offset` in U32 can wrap to a small in-bounds address): still a spec deviation, but the wrapped address is bounds-checked, so it cannot escape the arena. Fixing means threading base/offset separately through every accessor; deferred as a semantics (not safety) issue.
+- **qsort 64-byte element limit**: `abort()`s above 64 bytes. Nothing in w2c2 sorts elements that large (largest is `WasmFunctionID`, 24 bytes). Documented in a comment rather than generalized, to keep the libc small.
+- **realloc validating the block header**: the guest libc is inside the arena and is not itself a safety boundary (the runtime accessors are). A malformed guest pointer corrupts only guest memory, which stays inside the seccomp+arena box.
+
+### Measurement (after review 1)
+| component | files | code lines | tokens (o200k_base) |
+|---|---:|---:|---:|
+| w2c2 core (vendored, patched) | 45 | 12090 | 97775 |
+| w2c2 runtime header (rt/w2c2_base.h) | 1 | 179 | 3275 |
+| tcc (x86_64 Linux, 62c30a4a) | 20 | 27008 | 315053 |
+| minimal libc (libc/) | 16 | 420 | 5637 |
+| host (host/main.c) | 1 | 60 | 990 |
+| **total** | | **39757** | **422730** |
+
+Delta vs Experiment 2 (421,143 tokens): +1587 tokens for the three memory-safety fixes plus the libc hardening (+935 w2c2 core, +366 runtime header, +275 libc, +11 host). The safety of arbitrary wasm now rests on the runtime accessors, not on trusting the generated C.

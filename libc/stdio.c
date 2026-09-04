@@ -14,25 +14,38 @@ FILE* stderr = &std_files[2];
 static void write_all(int fd, const char* p, size_t n) {
     while (n) { ssize_t w = write(fd, p, n); if (w <= 0) _exit(120); p += w; n -= (size_t)w; }
 }
+/* grow a buffer to hold at least `need` bytes; allocation failure is fatal, never silent */
+static void grow(FILE* f, size_t need) {
+    void* q;
+    if (need < f->len) { write_all(2, "libc: size overflow\n", 20); _exit(121); }
+    while (f->cap < need) {
+        if (f->cap > (size_t)-1 / 2) { write_all(2, "libc: size overflow\n", 20); _exit(121); }
+        f->cap *= 2;
+    }
+    q = realloc(f->buf, f->cap);
+    if (!q) { write_all(2, "libc: out of memory\n", 20); _exit(122); }
+    f->buf = q;
+}
 
 FILE* fopen(const char* path, const char* mode) {
     FILE* f = calloc(1, sizeof *f);
     if (!f) return NULL;
     f->fd = -1;
     f->name = malloc(strlen(path) + 1);
+    f->cap = 65536; f->buf = malloc(f->cap);
+    if (!f->name || !f->buf) return NULL;
     strcpy(f->name, path);
     if (mode[0] == 'r') {            /* the single input: slurp stdin */
-        f->cap = 65536; f->buf = malloc(f->cap);
         for (;;) {
             ssize_t n;
-            if (f->len == f->cap) { f->cap *= 2; f->buf = realloc(f->buf, f->cap); }
+            if (f->len == f->cap) grow(f, f->cap + 1);
             n = read(0, f->buf + f->len, f->cap - f->len);
             if (n < 0) return NULL;
             if (n == 0) break;
             f->len += (size_t)n;
         }
     } else {
-        f->out = 1; f->cap = 65536; f->buf = malloc(f->cap);
+        f->out = 1;
     }
     return f;
 }
@@ -40,22 +53,23 @@ size_t fwrite(const void* p, size_t sz, size_t n, FILE* f) {
     size_t total = sz * n;
     if (f->fd >= 0) { write_all(f->fd, p, total); return n; }
     if (!f->out) return 0;
-    while (f->len + total > f->cap) { f->cap *= 2; f->buf = realloc(f->buf, f->cap); }
+    if (f->len + total > f->cap) grow(f, f->len + total);
     memcpy(f->buf + f->len, p, total);
     f->len += total;
     return n;
 }
 size_t fread(void* p, size_t sz, size_t n, FILE* f) {
     size_t total = sz * n;
-    if (f->fd >= 0 || f->out) return 0;
+    if (f->fd >= 0 || f->out || sz == 0 || n == 0 || f->pos >= f->len) return 0;
     if (total > f->len - f->pos) total = f->len - f->pos;
     memcpy(p, f->buf + f->pos, total);
     f->pos += total;
     return total / sz;
 }
 int fseek(FILE* f, long off, int whence) {
-    size_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? f->pos : f->len;
-    f->pos = base + (size_t)off;
+    long base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (long)f->pos : whence == SEEK_END ? (long)f->len : -1;
+    if (base < 0 || base + off < 0) return -1;
+    f->pos = (size_t)(base + off);
     return 0;
 }
 long ftell(FILE* f) { return (long)f->pos; }
@@ -112,6 +126,7 @@ static int format(Sink* k, const char* fmt, va_list ap) {
             body = num + 24 - len; break;
         default: abort(); /* floats and anything else are unsupported on purpose */
         }
+        if (neg && zero && !left) { put(k, "-", 1); body++; len--; width--; count++; }
         if (!left) while (width > len) { put(k, zero ? "0" : " ", 1); width--; count++; }
         put(k, body, (size_t)len); count += len;
         if (left) while (width > len) { put(k, " ", 1); width--; count++; }
@@ -156,7 +171,8 @@ unsigned long strtoul(const char* s, char** end, int base) {
     if (end) *end = (char*)s;
     return v;
 }
-/* deterministic, stable insertion sort: same result on every platform (glibc's qsort is not stable) */
+/* deterministic, stable insertion sort: same result on every platform (glibc's qsort is not stable).
+   Elements larger than 64 bytes abort: nothing in w2c2 sorts such elements (largest is 24 bytes). */
 void qsort(void* base, size_t n, size_t size, int (*cmp)(const void*, const void*)) {
     char* b = base; char tmp[64]; size_t i, j;
     if (size > sizeof tmp) abort();

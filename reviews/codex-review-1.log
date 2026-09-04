@@ -969,3 +969,2229 @@ build/w2c2/guest.c:54559:i->t0.data[offset+13]=(wasmFunc)&f91;
 build/w2c2/guest.c:54560:i->t0.data[offset+14]=(wasmFunc)&f112;
 build/w2c2/guest.c:54603:wasmTableFree(&i->t0);
 
+exec
+/bin/bash -lc "sed -n '54520,54570p' build/w2c2/guest.c | nl -ba -v54520; sed -n '175,220p' build/rot13/guest.c | nl -ba -v175; rg -o \"\\b[a-zA-Z0-9_]+\\(i->m[0-9]+,["'^;]*" build/w2c2/guest.c | sed '"'s/(.*//' | sort | uniq -c | sort -k2; rg -n \"memory_(copy|fill|init)|table_(get|set|grow|fill|copy|init)|data\\.drop|elem\\.drop|wasmMemoryCopy|wasmMemoryFill\" w2c2 rt build/w2c2/guest.c" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+ 54520	si1=l2;
+ 54521	si2=2U;
+ 54522	si1<<=(si2&31);
+ 54523	si0+=si1;
+ 54524	si1=l1;
+ 54525	i32_store(i->m0,si0,si1);
+ 54526	si0=1U;
+ 54527	L0:;
+ 54528	return si0;
+ 54529	}
+ 54530	
+ 54531	wasmFuncExport guestFuncExports[2] = {
+ 54532	{(wasmFunc)f129,"_start"},
+ 54533	{NULL,NULL}
+ 54534	};
+ 54535	
+ 54536	static void guestInitMemories(guestInstance* i, guestInstance* parent) {
+ 54537	i->m0 = wasmMemoryAllocate(64, 4096, false);
+ 54538	LOAD_DATA((*i->m0), 1024U, d0, 18060);
+ 54539	LOAD_DATA((*i->m0), 19088U, d1, 428);
+ 54540	}
+ 54541	
+ 54542	static void guestInitTables(guestInstance* i) {
+ 54543	U32 offset;
+ 54544	wasmTableAllocate(&i->t0, 16, 16);
+ 54545	offset=1U;
+ 54546	i->t0.data[offset+0]=(wasmFunc)&f76;
+ 54547	i->t0.data[offset+1]=(wasmFunc)&f75;
+ 54548	i->t0.data[offset+2]=(wasmFunc)&f77;
+ 54549	i->t0.data[offset+3]=(wasmFunc)&f79;
+ 54550	i->t0.data[offset+4]=(wasmFunc)&f81;
+ 54551	i->t0.data[offset+5]=(wasmFunc)&f82;
+ 54552	i->t0.data[offset+6]=(wasmFunc)&f83;
+ 54553	i->t0.data[offset+7]=(wasmFunc)&f84;
+ 54554	i->t0.data[offset+8]=(wasmFunc)&f86;
+ 54555	i->t0.data[offset+9]=(wasmFunc)&f87;
+ 54556	i->t0.data[offset+10]=(wasmFunc)&f88;
+ 54557	i->t0.data[offset+11]=(wasmFunc)&f89;
+ 54558	i->t0.data[offset+12]=(wasmFunc)&f90;
+ 54559	i->t0.data[offset+13]=(wasmFunc)&f91;
+ 54560	i->t0.data[offset+14]=(wasmFunc)&f112;
+ 54561	}
+ 54562	
+ 54563	static void guestInitGlobals(guestInstance* i) {
+ 54564	i->g0=1068128U;
+ 54565	}
+ 54566	
+ 54567	static void guestInitImports(guestInstance* i, void* resolve(const char* module, const char* name)) {
+ 54568	if (resolve == NULL) { return; }
+ 54569	}
+ 54570	
+   175	si0=(U32)((I32)si0>=(I32)si1);
+   176	if(si0){
+   177	goto L2;
+   178	}
+   179	}
+   180	L1:;
+   181	si0=l0;
+   182	si1=0U;
+   183	si0=si0 != si1;
+   184	L0:;
+   185	return si0;
+   186	}
+   187	
+   188	wasmFuncExport guestFuncExports[2] = {
+   189	{(wasmFunc)f7,"_start"},
+   190	{NULL,NULL}
+   191	};
+   192	
+   193	static void guestInitMemories(guestInstance* i, guestInstance* parent) {
+   194	i->m0 = wasmMemoryAllocate(16, 256, false);
+   195	}
+   196	
+   197	static void guestInitTables(guestInstance* i) {
+   198	wasmTableAllocate(&i->t0, 1, 1);
+   199	}
+   200	
+   201	static void guestInitGlobals(guestInstance* i) {
+   202	i->g0=70656U;
+   203	}
+   204	
+   205	static void guestInitImports(guestInstance* i, void* resolve(const char* module, const char* name)) {
+   206	if (resolve == NULL) { return; }
+   207	}
+   208	
+   209	wasmMemory*guest_memory(guestInstance* i){
+   210	return i->m0;
+   211	}
+   212	
+   213	void guest__start(guestInstance*i){
+   214	f7(i);
+   215	}
+   216	
+   217	guestInstance* guestNewChild(guestInstance* self) {
+   218	guestInstance* child = (guestInstance*)calloc(1, sizeof(guestInstance));
+   219	child->common.funcExports = self->common.funcExports;
+   220	child->common.resolveImports = self->common.resolveImports;
+   2147 i32_load
+    309 i32_load8_s
+    181 i32_load8_u
+   1613 i32_store
+     63 i32_store8
+    128 i64_load
+      1 i64_load32_s
+      2 i64_load32_u
+    285 i64_store
+      1 i64_store32
+      4 wasmMemoryGrow
+rt/w2c2_base.h:129:static W2C2_INLINE void wasmMemoryCopy(const wasmMemory* d, const wasmMemory* s, U32 da, U32 sa, U32 n) {
+rt/w2c2_base.h:133:static W2C2_INLINE void wasmMemoryFill(const wasmMemory* m, U32 da, U32 v, U32 n) {
+rt/w2c2_base.h:177:static W2C2_INLINE wasmFunc wasm_table_get(const wasmTable* t, U32 i) {
+rt/w2c2_base.h:182:#define TF(table, index, t) ((t)wasm_table_get(&(table), (index)))
+w2c2/opcode.c:803:        return "data.drop";
+w2c2/opcode.c:811:        return "elem.drop";
+w2c2/c.c:1572:    if (!wasmMemoryCopyInstructionRead(writer->code, &instruction)) {
+w2c2/c.c:1607:        MUST (wasmCWrite(writer, "wasmMemoryCopy("))
+w2c2/c.c:1679:        MUST (wasmCWrite(writer, "wasmMemoryFill("))
+w2c2/instruction.c:179:wasmMemoryCopyInstructionRead(
+w2c2/w2c2_base.h:835:wasmMemoryCopy(
+w2c2/w2c2_base.h:852:wasmMemoryFill(
+w2c2/instruction.h:204:wasmMemoryCopyInstructionRead(
+
+exec
+/bin/bash -lc "rg -n \"InitTables|offset\\+|element\" w2c2/c.c w2c2/*.c; sed -n '1380,1470p' w2c2/c.c; sed -n '1540,1705p' w2c2/c.c; readelf -sW build/w2c2/sandbox | rg 'wasm_arena|wasm_table|wasm_memory0| inst"'$|guestFuncExports'"'; readelf -lW build/w2c2/sandbox" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+w2c2/section.c:27:            return "element section";
+w2c2/reader.c:11:#include "elementsegment.h"
+w2c2/reader.c:109:            return "invalid element section element segment count";
+w2c2/reader.c:111:            return "invalid element section table index";
+w2c2/reader.c:113:            return "invalid element section offset expression";
+w2c2/reader.c:115:            return "invalid element section function index count";
+w2c2/reader.c:117:            return "invalid element section function index";
+w2c2/reader.c:1781:    /* Allocate element segment array */
+w2c2/reader.c:1791:    /* Read element segments */
+w2c2/reader.c:1827:    U32 elementSegmentCount = 0;
+w2c2/reader.c:1828:    WasmElementSegment* elementSegments = NULL;
+w2c2/reader.c:1830:    /* Read element count */
+w2c2/reader.c:1831:    if (leb128ReadU32(&reader->buffer, &elementSegmentCount) == 0) {
+w2c2/reader.c:1839:    /* Allocate element segment array */
+w2c2/reader.c:1840:    elementSegments = calloc(elementSegmentCount, sizeof(WasmElementSegment));
+w2c2/reader.c:1841:    if (elementSegments == NULL) {
+w2c2/reader.c:1849:    /* Read element segments */
+w2c2/reader.c:1851:        U32 elementSegmentIndex = 0;
+w2c2/reader.c:1852:        for (; elementSegmentIndex < elementSegmentCount; elementSegmentIndex++) {
+w2c2/reader.c:1853:            WasmElementSegment elementSegment = wasmEmptyElementSegment;
+w2c2/reader.c:1854:            wasmReadElementSegment(reader, &elementSegment, error);
+w2c2/reader.c:1858:            elementSegments[elementSegmentIndex] = elementSegment;
+w2c2/reader.c:1864:    reader->module->elementSegments.count = elementSegmentCount;
+w2c2/reader.c:1865:    reader->module->elementSegments.elementSegments = elementSegments;
+w2c2/reader.c:1870:    free(elementSegments);
+w2c2/c.c:5557:wasmCWriteInitTables(
+w2c2/c.c:5565:    const U32 elementSegmentCount = module->elementSegments.count;
+w2c2/c.c:5567:    if (tableCount > 0 || elementSegmentCount > 0) {
+w2c2/c.c:5571:        fprintf(file, "static void %sInitTables(%sInstance* i) {\n", moduleName, moduleName);
+w2c2/c.c:5573:        if (elementSegmentCount > 0) {
+w2c2/c.c:5595:            U32 elementSegmentIndex = 0;
+w2c2/c.c:5596:            for (; elementSegmentIndex < elementSegmentCount; elementSegmentIndex++) {
+w2c2/c.c:5597:                const WasmElementSegment elementSegment = module->elementSegments.elementSegments[elementSegmentIndex];
+w2c2/c.c:5606:                    const Buffer code = elementSegment.offset;
+w2c2/c.c:5615:                    for (; functionIndexIndex < elementSegment.functionIndexCount; functionIndexIndex++) {
+w2c2/c.c:5616:                        const U32 functionIndex = elementSegment.functionIndices[functionIndexIndex];
+w2c2/c.c:5620:                        wasmCWriteFileTableUse(file, module, elementSegment.tableIndex, false);
+w2c2/c.c:5624:                            fprintf(file, ".data[offset+%u]=(wasmFunc)", functionIndexIndex);
+w2c2/c.c:5802:        || module->elementSegments.count > 0
+w2c2/c.c:5807:        fprintf(file, "%sInitTables(child);\n", moduleName);
+w2c2/c.c:5878:        || module->elementSegments.count > 0
+w2c2/c.c:5883:        fprintf(file, "%sInitTables(i);\n", moduleName);
+w2c2/c.c:6050:    MUST (wasmCWriteInitTables(file, module, moduleName, pretty, multipleModules))
+w2c2/c.c:5557:wasmCWriteInitTables(
+w2c2/c.c:5565:    const U32 elementSegmentCount = module->elementSegments.count;
+w2c2/c.c:5567:    if (tableCount > 0 || elementSegmentCount > 0) {
+w2c2/c.c:5571:        fprintf(file, "static void %sInitTables(%sInstance* i) {\n", moduleName, moduleName);
+w2c2/c.c:5573:        if (elementSegmentCount > 0) {
+w2c2/c.c:5595:            U32 elementSegmentIndex = 0;
+w2c2/c.c:5596:            for (; elementSegmentIndex < elementSegmentCount; elementSegmentIndex++) {
+w2c2/c.c:5597:                const WasmElementSegment elementSegment = module->elementSegments.elementSegments[elementSegmentIndex];
+w2c2/c.c:5606:                    const Buffer code = elementSegment.offset;
+w2c2/c.c:5615:                    for (; functionIndexIndex < elementSegment.functionIndexCount; functionIndexIndex++) {
+w2c2/c.c:5616:                        const U32 functionIndex = elementSegment.functionIndices[functionIndexIndex];
+w2c2/c.c:5620:                        wasmCWriteFileTableUse(file, module, elementSegment.tableIndex, false);
+w2c2/c.c:5624:                            fprintf(file, ".data[offset+%u]=(wasmFunc)", functionIndexIndex);
+w2c2/c.c:5802:        || module->elementSegments.count > 0
+w2c2/c.c:5807:        fprintf(file, "%sInitTables(child);\n", moduleName);
+w2c2/c.c:5878:        || module->elementSegments.count > 0
+w2c2/c.c:5883:        fprintf(file, "%sInitTables(i);\n", moduleName);
+w2c2/c.c:6050:    MUST (wasmCWriteInitTables(file, module, moduleName, pretty, multipleModules))
+                functionName = "i64_store16";
+                break;
+            }
+            case wasmOpcodeI64Store32: {
+                functionName = "i64_store32";
+                break;
+            }
+            default: {
+                fprintf(
+                    stderr,
+                    "w2c2: unsupported store instruction opcode: %s\n",
+                    wasmOpcodeDescription(opcode)
+                );
+                return false;
+            }
+        }
+
+        MUST (wasmCWriteStore(writer, instruction, functionName))
+    }
+
+    return true;
+}
+
+static
+bool
+WARN_UNUSED_RESULT
+wasmCWriteMemorySizeExpr(
+    const WasmCFunctionWriter* writer
+) {
+    WasmMemoryInstruction instruction;
+    if (!wasmMemoryInstructionRead(writer->code, &instruction)) {
+        fprintf(stderr, "w2c2: invalid memory.size instruction encoding\n");
+        return false;
+    }
+
+    {
+        static const U32 expectedMemoryIndex = 0;
+        if (instruction.memoryIndex != expectedMemoryIndex) {
+            fprintf(
+                stderr,
+                "w2c2: invalid memory.size instruction: expected memory index %u, got %u\n",
+                expectedMemoryIndex,
+                instruction.memoryIndex
+            );
+            return false;
+        }
+    }
+
+    if (!writer->ignore) {
+        static const WasmValueType resultType = wasmValueTypeI32;
+
+        MUST (wasmTypeStackAppend(writer->typeStack, resultType))
+        {
+            const U32 stackIndex0 = wasmTypeStackGetTopIndex(writer->typeStack, 0);
+            MUST (wasmTypeStackSet(writer->stackDeclarations, stackIndex0, resultType))
+
+            MUST (wasmCWriteIndent(writer))
+            MUST (wasmCWriteStringStackName(
+                writer->builder,
+                stackIndex0,
+                resultType
+            ))
+            MUST (wasmCWriteAssign(writer))
+            MUST (wasmCWriteStringMemoryUse(
+                writer->builder,
+                writer->module,
+                instruction.memoryIndex,
+                false
+            ))
+            MUST (wasmCWrite(writer, ".pages;\n"))
+        }
+    }
+
+    return true;
+}
+
+static
+bool
+WARN_UNUSED_RESULT
+wasmCWriteMemoryGrowExpr(
+    const WasmCFunctionWriter* writer
+) {
+    WasmMemoryInstruction instruction;
+    if (!wasmMemoryInstructionRead(writer->code, &instruction)) {
+        fprintf(stderr, "w2c2: invalid memory.grow instruction encoding\n");
+        return false;
+    }
+
+    {
+        static const U32 expectedMemoryIndex = 0;
+        if (instruction.memoryIndex != expectedMemoryIndex) {
+            writer->typeStack->valueTypes[stackIndex2]
+        ))
+        MUST (wasmCWriteComma(writer))
+        /* TODO: add support for multiple modules */
+        MUST (wasmCWriteStringDataSegmentName(writer->builder, instruction.dataSegmentIndex))
+        MUST (wasmCWriteChar(writer, '+'))
+        MUST (wasmCWriteStringStackName(
+            writer->builder,
+            stackIndex1,
+            writer->typeStack->valueTypes[stackIndex1]
+        ))
+        MUST (wasmCWriteComma(writer))
+        MUST (wasmCWriteStringStackName(
+            writer->builder,
+            stackIndex0,
+            writer->typeStack->valueTypes[stackIndex0]
+        ))
+        MUST (wasmCWrite(writer, ");\n"))
+
+        wasmTypeStackDrop(writer->typeStack, 3);
+    }
+
+    return true;
+}
+
+static
+bool
+WARN_UNUSED_RESULT
+wasmCWriteMemoryCopyExpr(
+    const WasmCFunctionWriter* writer
+) {
+    WasmMemoryCopyInstruction instruction;
+    if (!wasmMemoryCopyInstructionRead(writer->code, &instruction)) {
+        fprintf(stderr, "w2c2: invalid memory.copy instruction encoding\n");
+        return false;
+    }
+
+    /* Validate */
+    {
+        static const U32 expectedMemoryIndex = 0;
+        if (instruction.memoryIndex1 != expectedMemoryIndex) {
+            fprintf(
+                stderr,
+                "w2c2: invalid memory.copy instruction: expected memory index 1 to be %u, got %u\n",
+                expectedMemoryIndex,
+                instruction.memoryIndex1
+            );
+            return false;
+        }
+
+        if (instruction.memoryIndex2 != expectedMemoryIndex) {
+            fprintf(
+                stderr,
+                "w2c2: invalid memory.copy instruction: expected memory index 2 to be %u, got %u\n",
+                expectedMemoryIndex,
+                instruction.memoryIndex2
+            );
+            return false;
+        }
+    }
+
+    if (!writer->ignore) {
+        const U32 stackIndex0 = wasmTypeStackGetTopIndex(writer->typeStack, 0);
+        const U32 stackIndex1 = wasmTypeStackGetTopIndex(writer->typeStack, 1);
+        const U32 stackIndex2 = wasmTypeStackGetTopIndex(writer->typeStack, 2);
+
+        MUST (wasmCWriteIndent(writer))
+        MUST (wasmCWrite(writer, "wasmMemoryCopy("))
+        MUST (wasmCWriteStringMemoryUse(
+            writer->builder,
+            writer->module,
+            instruction.memoryIndex1,
+            true
+        ))
+        MUST (wasmCWriteComma(writer))
+        MUST (wasmCWriteStringMemoryUse(
+            writer->builder,
+            writer->module,
+            instruction.memoryIndex2,
+            true
+        ))
+        MUST (wasmCWriteComma(writer))
+        MUST (wasmCWriteStringStackName(
+            writer->builder,
+            stackIndex2,
+            writer->typeStack->valueTypes[stackIndex2]
+        ))
+        MUST (wasmCWriteComma(writer))
+        MUST (wasmCWriteStringStackName(
+            writer->builder,
+            stackIndex1,
+            writer->typeStack->valueTypes[stackIndex1]
+        ))
+        MUST (wasmCWriteComma(writer))
+        MUST (wasmCWriteStringStackName(
+            writer->builder,
+            stackIndex0,
+            writer->typeStack->valueTypes[stackIndex0]
+        ))
+        MUST (wasmCWrite(writer, ");\n"))
+
+        wasmTypeStackDrop(writer->typeStack, 3);
+    }
+
+    return true;
+}
+
+static
+bool
+WARN_UNUSED_RESULT
+wasmCWriteMemoryFillExpr(
+    const WasmCFunctionWriter* writer,
+    const WasmMiscOpcode miscOpcode
+) {
+    WasmMemoryInstruction instruction;
+    if (!wasmMemoryInstructionRead(writer->code, &instruction)) {
+        fprintf(stderr, "w2c2: invalid memory.fill instruction encoding\n");
+        return false;
+    }
+
+    {
+        static const U32 expectedMemoryIndex = 0;
+        if (instruction.memoryIndex != expectedMemoryIndex) {
+            fprintf(
+                stderr,
+                "w2c2: invalid memory.fill instruction: expected memory index %u, got %u\n",
+                expectedMemoryIndex,
+                instruction.memoryIndex
+            );
+            return false;
+        }
+    }
+
+    if (!writer->ignore) {
+        const U32 stackIndex0 = wasmTypeStackGetTopIndex(writer->typeStack, 0);
+        const U32 stackIndex1 = wasmTypeStackGetTopIndex(writer->typeStack, 1);
+        const U32 stackIndex2 = wasmTypeStackGetTopIndex(writer->typeStack, 2);
+
+        MUST (wasmCWriteIndent(writer))
+        MUST (wasmCWrite(writer, "wasmMemoryFill("))
+        MUST (wasmCWriteStringMemoryUse(
+            writer->builder,
+            writer->module,
+            instruction.memoryIndex,
+            true
+        ))
+        MUST (wasmCWriteComma(writer))
+        MUST (wasmCWriteStringStackName(
+            writer->builder,
+            stackIndex2,
+            writer->typeStack->valueTypes[stackIndex2]
+        ))
+        MUST (wasmCWriteComma(writer))
+        MUST (wasmCWriteStringStackName(
+            writer->builder,
+            stackIndex1,
+            writer->typeStack->valueTypes[stackIndex1]
+        ))
+        MUST (wasmCWriteComma(writer))
+        MUST (wasmCWriteStringStackName(
+            writer->builder,
+            stackIndex0,
+            writer->typeStack->valueTypes[stackIndex0]
+        ))
+        MUST (wasmCWrite(writer, ");\n"))
+
+
+Elf file type is EXEC (Executable file)
+Entry point 0x400683
+There are 2 program headers, starting at offset 64
+
+Program Headers:
+  Type           Offset   VirtAddr           PhysAddr           FileSiz  MemSiz   Flg Align
+  LOAD           0x000000 0x0000000000400000 0x0000000000400000 0x0a6280 0x0a6280 R E 0x200000
+  LOAD           0x0a6280 0x00000000006a6280 0x00000000006a6280 0x004958 0x100069c0 RW  0x200000
+
+ Section to Segment mapping:
+  Segment Sections...
+   00     .text 
+   01     .data .got .bss 
+
+exec
+/bin/bash -lc 'for f in build/rot13/sandbox build/w2c2/sandbox; do echo "$f"; readelf -hW "$f" | rg '"'Type:|Machine:|Entry'; readelf -dW \""'$f" 2>&1 || true; nm -u "$f" 2>&1 || true; objdump -d "$f" | rg -n '"'\\bsyscall\\b|\\bint\\s+\\"'$0x80|'"\\bsysenter\\b'; done; sed -n '5550,5640p' w2c2/c.c; rg -n \"wasmCWriteLoad|wasmCWriteStore|offset\" w2c2/c.c | head -n 50" in /home/exedev/sandbox-stack
+ succeeded in 163ms:
+19:  4000db:	0f 05                	syscall
+        fputs(";\n", file);
+    }
+}
+
+static
+bool
+WARN_UNUSED_RESULT
+wasmCWriteInitTables(
+    FILE* file,
+    const WasmModule* module,
+    const char* moduleName,
+    const bool pretty,
+    const bool multipleModules
+) {
+    const size_t tableImportCount = module->tableImports.length;
+    const U32 elementSegmentCount = module->elementSegments.count;
+    const U32 tableCount = module->tables.count;
+    if (tableCount > 0 || elementSegmentCount > 0) {
+        StringBuilder stringBuilder = emptyStringBuilder;
+        MUST (stringBuilderInitialize(&stringBuilder))
+
+        fprintf(file, "static void %sInitTables(%sInstance* i) {\n", moduleName, moduleName);
+
+        if (elementSegmentCount > 0) {
+            if (pretty) {
+                fputs(indentation, file);
+            }
+            fputs("U32 offset;\n", file);
+        }
+
+        {
+            U32 tableIndex = 0;
+            for (; tableIndex < tableCount; tableIndex++) {
+                const WasmTable table = module->tables.tables[tableIndex];
+
+                if (pretty) {
+                    fputs(indentation, file);
+                }
+                fputs("wasmTableAllocate(", file);
+                wasmCWriteFileTableUse(file, module, assertSizeU32(tableImportCount) + tableIndex, true);
+                fprintf(file, ", %u, %u);\n", table.min, table.max);
+            }
+        }
+
+        {
+            U32 elementSegmentIndex = 0;
+            for (; elementSegmentIndex < elementSegmentCount; elementSegmentIndex++) {
+                const WasmElementSegment elementSegment = module->elementSegments.elementSegments[elementSegmentIndex];
+
+                if (pretty) {
+                    fputs(indentation, file);
+                    fputs("offset = ", file);
+                } else {
+                    fputs("offset=", file);
+                }
+                {
+                    const Buffer code = elementSegment.offset;
+                    MUST (stringBuilderReset(&stringBuilder))
+                    MUST (wasmCWriteConstantExpr(&stringBuilder, module, code))
+                    fputs(stringBuilder.string, file);
+                }
+                fputs(";\n", file);
+
+                {
+                    U32 functionIndexIndex = 0;
+                    for (; functionIndexIndex < elementSegment.functionIndexCount; functionIndexIndex++) {
+                        const U32 functionIndex = elementSegment.functionIndices[functionIndexIndex];
+                        if (pretty) {
+                            fputs(indentation, file);
+                        }
+                        wasmCWriteFileTableUse(file, module, elementSegment.tableIndex, false);
+                        if (pretty) {
+                            fprintf(file, ".data[offset + %u] = (wasmFunc)", functionIndexIndex);
+                        } else {
+                            fprintf(file, ".data[offset+%u]=(wasmFunc)", functionIndexIndex);
+                        }
+                        wasmCWriteFileFunctionUse(file, module, moduleName, functionIndex, true, multipleModules);
+                        fputs(";\n", file);
+                    }
+                }
+            }
+        }
+
+        fputs("}\n\n", file);
+
+        stringBuilderFree(&stringBuilder);
+    }
+
+    return true;
+}
+
+1145:wasmCWriteLoad(
+1165:    if (instruction.offset != 0) {
+1167:        MUST (stringBuilderAppendU32(writer->builder, instruction.offset))
+1182:wasmCWriteLoadExpr(
+1281:        MUST (wasmCWriteLoad(
+1295:wasmCWriteStore(
+1313:    if (instruction.offset != 0) {
+1315:        MUST (stringBuilderAppendU32(writer->builder, instruction.offset))
+1334:wasmCWriteStoreExpr(
+1397:        MUST (wasmCWriteStore(writer, instruction, functionName))
+2860:        MUST (wasmCWriteLoad(
+2948:        MUST (wasmCWriteStore(writer, instruction, functionName))
+3273:            if (instruction.offset != 0) {
+3275:                MUST (stringBuilderAppendU32(writer->builder, instruction.offset))
+3398:            if (instruction.offset != 0) {
+3400:                MUST (stringBuilderAppendU32(writer->builder, instruction.offset))
+3536:                MUST (wasmCWriteLoadExpr(writer, *opcode))
+3548:                MUST (wasmCWriteStoreExpr(writer, *opcode))
+5421:                const Buffer code = dataSegment.offset;
+5577:            fputs("U32 offset;\n", file);
+5601:                    fputs("offset = ", file);
+5603:                    fputs("offset=", file);
+5606:                    const Buffer code = elementSegment.offset;
+5622:                            fprintf(file, ".data[offset + %u] = (wasmFunc)", functionIndexIndex);
+5624:                            fprintf(file, ".data[offset+%u]=(wasmFunc)", functionIndexIndex);
+
+exec
+/bin/bash -lc "rg -n \"qsort\\(|sprintf\\(|fprintf\\(|printf\\(|fopen\\(|fread\\(|fwrite\\(|fseek\\(|realloc\\(\" w2c2 --glob '*.[ch]' | head -n 300; rg -n \"qsort\" w2c2 -C 8; rg -n \"sprintf|fprintf|printf\" w2c2 --glob '*.[ch]' | sed -n '1,220p'" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+w2c2/main.c:55:        fprintf(stderr, "w2c2: failed to read file %s\n", path);
+w2c2/main.c:64:        fprintf(
+w2c2/main.c:140:        qsort(
+w2c2/main.c:215:            fprintf(stderr, "w2c2: failed to glob files to clean\n");
+w2c2/main.c:227:            fprintf(stderr, "w2c2: failed to find files to clean\n");
+w2c2/main.c:262:        fprintf(stderr, "w2c2: cleaning file: %s\n", path);
+w2c2/main.c:265:            fprintf(stderr, "w2c2: failed to remove file %s\n", path);
+w2c2/main.c:290:        fprintf(stderr, "w2c2: failed to change to output directory %s\n", outputDir);
+w2c2/main.c:357:                    fprintf(
+w2c2/main.c:369:                    fprintf(
+w2c2/main.c:383:                fprintf(
+w2c2/main.c:411:                    fprintf(stderr, "w2c2: unknown option `-%c'.\n", optopt);
+w2c2/main.c:413:                    fprintf(
+w2c2/main.c:441:        fprintf(
+w2c2/main.c:453:        fprintf(
+w2c2/main.c:500:            fprintf(
+w2c2/main.c:538:            fprintf(stderr, "w2c2: failed to compile\n");
+w2c2/opcode.c:562:            fprintf(
+w2c2/opcode.c:769:            fprintf(
+w2c2/array.c:20:        newItems = realloc(*items, newCapacity * itemSize);
+w2c2/debug.c:197:            fprintf(stderr, "w2c2: failed to get child DIE\n");
+w2c2/debug.c:210:            fprintf(stderr, "w2c2: failed to get DIE tag\n");
+w2c2/debug.c:229:                fprintf(stderr, "w2c2: failed to get child sibling DIE\n");
+w2c2/debug.c:250:        fprintf(stderr, "w2c2: failed to allocate DWARF interface\n");
+w2c2/debug.c:259:        fprintf(stderr, "w2c2: failed to init DWARF reader\n");
+w2c2/debug.c:284:            fprintf(stderr, "w2c2: failed to get DIE tag\n");
+w2c2/debug.c:289:            fprintf(stderr, "w2c2: unexpected non-compile unit DIE tag: %d\n", tag);
+w2c2/debug.c:295:            fprintf(stderr, "w2c2: failed to get CU DIE files\n");
+w2c2/debug.c:303:            fprintf(stderr, "w2c2: failed to get lines\n");
+w2c2/debug.c:315:                fprintf(stderr, "w2c2: failed to get line address\n");
+w2c2/debug.c:327:                fprintf(stderr, "w2c2: failed to get line source\n");
+w2c2/debug.c:336:                fprintf(stderr, "w2c2: failed to get line number\n");
+w2c2/debug.c:363:        fprintf(stderr, "w2c2: failed to finish DWARF reader\n");
+w2c2/debug.c:371:    qsort(
+w2c2/debug.c:585:            fprintf(stderr, "w2c2: failed to get child DIE\n");
+w2c2/debug.c:598:            fprintf(stderr, "w2c2: failed to get DIE tag\n");
+w2c2/debug.c:617:                fprintf(stderr, "w2c2: failed to get child sibling DIE\n");
+w2c2/debug.c:638:        fprintf(stderr, "w2c2: failed to allocate DWARF interface\n");
+w2c2/debug.c:647:        fprintf(stderr, "w2c2: failed to init DWARF reader\n");
+w2c2/debug.c:675:            fprintf(stderr, "w2c2: failed to get DIE tag\n");
+w2c2/debug.c:680:            fprintf(stderr, "w2c2: unexpected non-compile unit DIE tag: %d\n", tag);
+w2c2/debug.c:686:            fprintf(stderr, "w2c2: failed to get CU DIE files\n");
+w2c2/debug.c:694:            fprintf(stderr, "w2c2: failed to get line context\n");
+w2c2/debug.c:700:            fprintf(stderr, "w2c2: failed to get lines from context\n");
+w2c2/debug.c:712:                fprintf(stderr, "w2c2: failed to get line address\n");
+w2c2/debug.c:724:                fprintf(stderr, "w2c2: failed to get line source\n");
+w2c2/debug.c:733:                fprintf(stderr, "w2c2: failed to get line number\n");
+w2c2/debug.c:760:        fprintf(stderr, "w2c2: failed to finish DWARF reader\n");
+w2c2/debug.c:768:    qsort(
+w2c2/file.c:16:    file = fopen(path, "rb");
+w2c2/file.c:20:    fseek(file, 0, SEEK_END);
+w2c2/file.c:29:    read = fread(data, 1, size, file);
+w2c2/stringbuilder.c:16:        void* newString = realloc(stringBuilder->string, newCapacity);
+w2c2/stringbuilder.c:117:    const int length = sprintf(buffer, "%u", value);
+w2c2/stringbuilder.c:127:    const int length = sprintf(buffer, "%i", value);
+w2c2/stringbuilder.c:137:    const int length = sprintf(buffer, "%llu", value);
+w2c2/stringbuilder.c:147:    const int length = sprintf(buffer, "%lli", value);
+w2c2/stringbuilder.c:157:    const int length = sprintf(buffer, "%02X", value);
+w2c2/stringbuilder.c:167:    const int length = sprintf(buffer, "%08X", value);
+w2c2/stringbuilder.c:177:    const int length = sprintf(buffer, "%016llX", value);
+w2c2/getopt_impl.h:80:        (void)printf("illegal option -- %c\n", optopt);
+w2c2/getopt_impl.h:96:        (void)printf("option requires an argument -- %c\n", optopt);
+w2c2/reader.c:358:    qsort(
+w2c2/reader.c:370:            fprintf(
+w2c2/reader.c:488:            fprintf(
+w2c2/reader.c:546:        fprintf(stderr, "w2c2: skipping custom section '%s' (size %u)\n", name, sectionSize);
+w2c2/reader.c:1974:    fprintf(
+w2c2/w2c2_base.h:808:            U8* newData = (U8*)realloc(memory->data, newSize);
+w2c2/c.c:56:    fprintf(file, "%c%u", localNamePrefix, localIndex);
+w2c2/c.c:84:            fprintf(file, "%c%02X", escapeChar, c);
+w2c2/c.c:132:    fprintf(file, "%u", globalIndex);
+w2c2/c.c:217:    fprintf(file, "%u", memoryIndex);
+w2c2/c.c:237:    fprintf(file, "%s->", variableName);
+w2c2/c.c:285:    fprintf(file, "%u", tableIndex);
+w2c2/c.c:358:    fprintf(file, "%u", dataSegmentIndex);
+w2c2/c.c:381:    fprintf(file, "f%u", functionIndex);
+w2c2/c.c:449:    fprintf(
+w2c2/c.c:514:            fprintf(stderr, "w2c2: unsupported function with multiple result values\n");
+w2c2/c.c:667:        fprintf(stderr, "w2c2: invalid call instruction encoding\n");
+w2c2/c.c:763:        fprintf(stderr, "w2c2: invalid call_indirect instruction encoding\n");
+w2c2/c.c:845:        fprintf(stderr, "w2c2: invalid local.get instruction encoding\n");
+w2c2/c.c:858:            fprintf(
+w2c2/c.c:890:        fprintf(
+w2c2/c.c:907:            fprintf(
+w2c2/c.c:944:        fprintf(
+w2c2/c.c:960:            fprintf(
+w2c2/c.c:994:        fprintf(
+w2c2/c.c:1010:            fprintf(
+w2c2/c.c:1101:            fprintf(stderr, "w2c2: unsupported const type %s\n", wasmValueTypeDescription(valueType));
+w2c2/c.c:1117:        fprintf(
+w2c2/c.c:1189:        fprintf(
+w2c2/c.c:1272:                fprintf(
+w2c2/c.c:1340:        fprintf(
+w2c2/c.c:1388:                fprintf(
+w2c2/c.c:1411:        fprintf(stderr, "w2c2: invalid memory.size instruction encoding\n");
+w2c2/c.c:1418:            fprintf(
+w2c2/c.c:1464:        fprintf(stderr, "w2c2: invalid memory.grow instruction encoding\n");
+w2c2/c.c:1471:            fprintf(
+w2c2/c.c:1519:        fprintf(stderr, "w2c2: invalid memory.init instruction encoding\n");
+w2c2/c.c:1573:        fprintf(stderr, "w2c2: invalid memory.copy instruction encoding\n");
+w2c2/c.c:1581:            fprintf(
+w2c2/c.c:1591:            fprintf(
+w2c2/c.c:1656:        fprintf(stderr, "w2c2: invalid memory.fill instruction encoding\n");
+w2c2/c.c:1663:            fprintf(
+w2c2/c.c:2071:        fprintf(
+w2c2/c.c:2182:        fprintf(
+w2c2/c.c:2248:        fprintf(
+w2c2/c.c:2404:        fprintf(stderr, "w2c2: invalid br instruction encoding\n");
+w2c2/c.c:2424:        fprintf(stderr, "w2c2: invalid br.if instruction encoding\n");
+w2c2/c.c:2473:        fprintf(stderr, "w2c2: invalid br_table instruction encoding\n");
+w2c2/c.c:2596:        fprintf(
+w2c2/c.c:2711:        fprintf(
+w2c2/c.c:2735:        fprintf(
+w2c2/c.c:2759:        fprintf(
+w2c2/c.c:2784:        fprintf(
+w2c2/c.c:2840:                fprintf(
+w2c2/c.c:2850:            fprintf(
+w2c2/c.c:2880:        fprintf(
+w2c2/c.c:2928:                fprintf(
+w2c2/c.c:2938:            fprintf(
+w2c2/c.c:2963:        fprintf(
+w2c2/c.c:3235:                fprintf(
+w2c2/c.c:3245:            fprintf(
+w2c2/c.c:3303:        fprintf(
+w2c2/c.c:3359:                fprintf(
+w2c2/c.c:3369:            fprintf(
+w2c2/c.c:3674:                        fprintf(
+w2c2/c.c:3698:                        fprintf(
+w2c2/c.c:3712:                        fprintf(
+w2c2/c.c:3728:                        fprintf(
+w2c2/c.c:3742:                        fprintf(
+w2c2/c.c:3756:                        fprintf(
+w2c2/c.c:3770:                        fprintf(
+w2c2/c.c:3817:                                fprintf(
+w2c2/c.c:4287:                        fprintf(
+w2c2/c.c:4409:            fprintf(stderr, "w2c2: function with multiple return values\n");
+w2c2/c.c:4562:                fprintf(file, " __asm__(\"%s_%s\")", moduleName, functionName);
+w2c2/c.c:4603:                fprintf(file, "#line %u \"%s\"\n", (U32)debugLine->number, debugLine->path);
+w2c2/c.c:4716:                fprintf(stderr, "w2c2: invalid const instruction encoding\n");
+w2c2/c.c:4729:            fprintf(stderr, "w2c2: invalid init expression instruction %s\n", wasmOpcodeDescription(opcode));
+w2c2/c.c:4753:        fprintf(file, "static void %sInitGlobals(%sInstance* i) {\n", moduleName, moduleName);
+w2c2/c.c:4821:    fprintf(file, "resolve(\"%s\", \"%s\");\n", module, name);
+w2c2/c.c:4942:    fprintf(
+w2c2/c.c:4970:    fprintf(file, "%s_", moduleName);
+w2c2/c.c:5044:    fprintf(file, "(%sInstance* i)", moduleName);
+w2c2/c.c:5098:                fprintf(
+w2c2/c.c:5161:                            fprintf(file, "%u", value);
+w2c2/c.c:5163:                            fprintf(file, "0x%x", value);
+w2c2/c.c:5200:            fprintf(stderr, "w2c2: unsupported data segment mode: %d\n", mode);
+w2c2/c.c:5254:            fprintf(stderr, "w2c2: unsupported data segment mode: %d\n", mode);
+w2c2/c.c:5259:    segmentsFile = fopen(filename, "wb");
+w2c2/c.c:5261:        fprintf(
+w2c2/c.c:5273:        const size_t written = fwrite(dataSegment.bytes.data, 1, length, segmentsFile);
+w2c2/c.c:5275:            fprintf(
+w2c2/c.c:5286:        fprintf(
+w2c2/c.c:5359:        fprintf(
+w2c2/c.c:5384:                        fprintf(file, "= WASM_MEMORY_ALLOCATE_SHARED(%u, %u);\n", memory.min, memory.max);
+w2c2/c.c:5409:                    fprintf(file, " = wasmMemoryAllocate(%u, %u, false);\n", memory.min, memory.max);
+w2c2/c.c:5432:                                fprintf(file, " = ds + %llu", byteOffset);
+w2c2/c.c:5434:                                fprintf(file, "=ds+%llu", byteOffset);
+w2c2/c.c:5466:                                fprintf(file, ", ds+%llu", byteOffset);
+w2c2/c.c:5473:                        fprintf(file, ", %lu);\n", (unsigned long) dataSegmentLength);
+w2c2/c.c:5571:        fprintf(file, "static void %sInitTables(%sInstance* i) {\n", moduleName, moduleName);
+w2c2/c.c:5590:                fprintf(file, ", %u, %u);\n", table.min, table.max);
+w2c2/c.c:5622:                            fprintf(file, ".data[offset + %u] = (wasmFunc)", functionIndexIndex);
+w2c2/c.c:5624:                            fprintf(file, ".data[offset+%u]=(wasmFunc)", functionIndexIndex);
+w2c2/c.c:5699:    fprintf(file, "#include \"%s\"\n\n", headerName);
+w2c2/c.c:5710:    fprintf(file, "typedef struct %sInstance {\n", moduleName);
+w2c2/c.c:5725:    fprintf(file, "} %sInstance;\n\n", moduleName);
+w2c2/c.c:5754:    fprintf(
+w2c2/c.c:5766:    fprintf(
+w2c2/c.c:5792:    fprintf(file, "%sInitImports(child, self->common.resolveImports);\n", moduleName);
+w2c2/c.c:5798:        fprintf(file, "%sInitMemories(child, self);\n", moduleName);
+w2c2/c.c:5807:        fprintf(file, "%sInitTables(child);\n", moduleName);
+w2c2/c.c:5814:        fprintf(file, "%sInitGlobals(child);\n", moduleName);
+w2c2/c.c:5843:    fprintf(
+w2c2/c.c:5853:    fprintf(file, "i->common.funcExports = %sFuncExports;\n", moduleName);
+w2c2/c.c:5863:    fprintf(file, "i->common.newChild = (struct wasmModuleInstance* (*)(struct wasmModuleInstance*))%sNewChild;\n", moduleName);
+w2c2/c.c:5868:    fprintf(file, "%sInitImports(i, resolveImports);\n", moduleName);
+w2c2/c.c:5874:        fprintf(file, "%sInitMemories(i, NULL);\n", moduleName);
+w2c2/c.c:5883:        fprintf(file, "%sInitTables(i);\n", moduleName);
+w2c2/c.c:5890:        fprintf(file, "%sInitGlobals(i);\n", moduleName);
+w2c2/c.c:5912:    fprintf(file, "void %sFreeInstance(%sInstance* i) {\n", moduleName, moduleName);
+w2c2/c.c:5934:    file = fopen(filename, "w");
+w2c2/c.c:5936:        fprintf(
+w2c2/c.c:5945:    fprintf(file, "#ifndef %s_H\n", moduleName);
+w2c2/c.c:5946:    fprintf(file, "#define %s_H\n\n", moduleName);
+w2c2/c.c:5952:    fprintf(
+w2c2/c.c:5958:    fprintf(
+w2c2/c.c:5967:    fprintf(file, "#endif /* %s_H */\n\n", moduleName);
+w2c2/c.c:5970:        fprintf(
+w2c2/c.c:6003:    fprintf(
+w2c2/c.c:6027:            fprintf(file, ",\"%s\"},\n", export.name);
+w2c2/c.c:6094:    sprintf(filename, "%c%010u.c", filePrefix, fileIndex);
+w2c2/c.c:6095:    file = fopen(filename, "w");
+w2c2/c.c:6097:        fprintf(
+w2c2/c.c:6122:        fprintf(
+w2c2/c.c:6244:                    fprintf(
+w2c2/c.c:6314:                fprintf(
+w2c2/c.c:6386:                fprintf(stderr, "w2c2: failed to join writer thread: %s\n", strerror(err));
+w2c2/c.c:6415:    file = fopen(filename, "w");
+w2c2/c.c:6417:        fprintf(
+w2c2/c.c:6444:            fprintf(stderr, "w2c2: unsupported data segment mode: %d\n", options.dataSegmentMode);
+w2c2/c.c:6509:        fprintf(
+w2c2/main.c-106-int
+w2c2/main.c-107-wasmFunctionIDsCompareHashes(
+w2c2/main.c-108-    const void* a,
+w2c2/main.c-109-    const void* b
+w2c2/main.c-110-) {
+w2c2/main.c-111-    const WasmFunctionID* functionIDA = a;
+w2c2/main.c-112-    const WasmFunctionID* functionIDB = b;
+w2c2/main.c-113-    const int c = memcmp(functionIDA->hash, functionIDB->hash, SHA1_DIGEST_LENGTH);
+w2c2/main.c:114:    /* patched: total order (tie-break on index) so output does not depend on qsort stability */
+w2c2/main.c-115-    if (c != 0) {
+w2c2/main.c-116-        return c;
+w2c2/main.c-117-    }
+w2c2/main.c-118-    return functionIDA->functionIndex < functionIDB->functionIndex ? -1
+w2c2/main.c-119-         : functionIDA->functionIndex > functionIDB->functionIndex ? 1 : 0;
+w2c2/main.c-120-}
+w2c2/main.c-121-
+w2c2/main.c-122-WasmFunctionIDs
+--
+w2c2/main.c-132-        memcpy(functionID.hash, function.hash, SHA1_DIGEST_LENGTH);
+w2c2/main.c-133-        functionID.functionIndex = functionIndex;
+w2c2/main.c-134-        if (!wasmFunctionIDsAppend(&result, functionID)) {
+w2c2/main.c-135-            exit(1);
+w2c2/main.c-136-        }
+w2c2/main.c-137-    }
+w2c2/main.c-138-
+w2c2/main.c-139-    if (result.length > 1) {
+w2c2/main.c:140:        qsort(
+w2c2/main.c-141-            result.functionIDs,
+w2c2/main.c-142-            result.length,
+w2c2/main.c-143-            sizeof(WasmFunctionID),
+w2c2/main.c-144-            wasmFunctionIDsCompareHashes
+w2c2/main.c-145-        );
+w2c2/main.c-146-    }
+w2c2/main.c-147-
+w2c2/main.c-148-    return result;
+--
+w2c2/debug.c-363-        fprintf(stderr, "w2c2: failed to finish DWARF reader\n");
+w2c2/debug.c-364-    }
+w2c2/debug.c-365-
+w2c2/debug.c-366-end:
+w2c2/debug.c-367-    if (interface != NULL) {
+w2c2/debug.c-368-        free(interface);
+w2c2/debug.c-369-    }
+w2c2/debug.c-370-
+w2c2/debug.c:371:    qsort(
+w2c2/debug.c-372-        debugLines.debugLines,
+w2c2/debug.c-373-        debugLines.length,
+w2c2/debug.c-374-        sizeof(WasmDebugLine),
+w2c2/debug.c-375-        compareDebugLines
+w2c2/debug.c-376-    );
+w2c2/debug.c-377-
+w2c2/debug.c-378-    return debugLines;
+w2c2/debug.c-379-}
+--
+w2c2/debug.c-760-        fprintf(stderr, "w2c2: failed to finish DWARF reader\n");
+w2c2/debug.c-761-    }
+w2c2/debug.c-762-
+w2c2/debug.c-763-end:
+w2c2/debug.c-764-    if (interface != NULL) {
+w2c2/debug.c-765-        free(interface);
+w2c2/debug.c-766-    }
+w2c2/debug.c-767-
+w2c2/debug.c:768:    qsort(
+w2c2/debug.c-769-        debugLines.debugLines,
+w2c2/debug.c-770-        debugLines.length,
+w2c2/debug.c-771-        sizeof(WasmDebugLine),
+w2c2/debug.c-772-        compareDebugLines
+w2c2/debug.c-773-    );
+w2c2/debug.c-774-
+w2c2/debug.c-775-    return debugLines;
+w2c2/debug.c-776-}
+--
+w2c2/PATCHES.md-6-   `f32_reinterpret_i32(0x..)` / `f64_reinterpret_i64(0x..)`. Upstream printed
+w2c2/PATCHES.md-7-   finite non-negative-zero values with `%.9g` / `%.17g`, which (a) needs a
+w2c2/PATCHES.md-8-   correct decimal float printer in the guest libc and (b) is a platform
+w2c2/PATCHES.md-9-   nondeterminism source. Hex is exact and identical everywhere.
+w2c2/PATCHES.md-10-2. `stringbuilder.c/.h`: removed `stringBuilderAppendF32/F64` (only users of float printf).
+w2c2/PATCHES.md-11-3. `main.c`: the "%.2f%%" statistic on stderr in the reference-module path is now an integer message.
+w2c2/PATCHES.md-12-4. `main.c` `wasmFunctionIDsCompareHashes`: tie-break on function index. Functions
+w2c2/PATCHES.md-13-   are emitted in hash order; identical bodies hash equal, so the emitted order of
+w2c2/PATCHES.md:14:   duplicates depended on the platform qsort's stability (glibc mergesort: stable;
+w2c2/PATCHES.md-15-   musl smoothsort: not). Now a total order.
+w2c2/PATCHES.md-16-5. `main.c` `cleanImplementationFiles`: without glob/Win32 the function is a no-op
+w2c2/PATCHES.md-17-   instead of `#error` (the wasm guest has no directory listing).
+--
+w2c2/reader.c-350-    }
+w2c2/reader.c-351-
+w2c2/reader.c-352-    for (; functionNameIndex < functionNameCount; functionNameIndex++) {
+w2c2/reader.c-353-        WasmFunctionNameEntry *entry = &entries[functionNameIndex];
+w2c2/reader.c-354-        entry->functionIndex = functionNameIndex;
+w2c2/reader.c-355-        entry->name = functionNames->names[functionNameIndex];
+w2c2/reader.c-356-    }
+w2c2/reader.c-357-
+w2c2/reader.c:358:    qsort(
+w2c2/reader.c-359-        entries,
+w2c2/reader.c-360-        functionNameCount,
+w2c2/reader.c-361-        sizeof(WasmFunctionNameEntry),
+w2c2/reader.c-362-        wasmFunctionNameEntryCompareNames
+w2c2/reader.c-363-    );
+w2c2/reader.c-364-
+w2c2/reader.c-365-    for (functionNameIndex = 1; functionNameIndex < functionNameCount; functionNameIndex++) {
+w2c2/reader.c-366-        const WasmFunctionNameEntry previous = entries[functionNameIndex - 1];
+w2c2/main.c:55:        fprintf(stderr, "w2c2: failed to read file %s\n", path);
+w2c2/main.c:64:        fprintf(
+w2c2/main.c:215:            fprintf(stderr, "w2c2: failed to glob files to clean\n");
+w2c2/main.c:227:            fprintf(stderr, "w2c2: failed to find files to clean\n");
+w2c2/main.c:262:        fprintf(stderr, "w2c2: cleaning file: %s\n", path);
+w2c2/main.c:265:            fprintf(stderr, "w2c2: failed to remove file %s\n", path);
+w2c2/main.c:290:        fprintf(stderr, "w2c2: failed to change to output directory %s\n", outputDir);
+w2c2/main.c:357:                    fprintf(
+w2c2/main.c:369:                    fprintf(
+w2c2/main.c:383:                fprintf(
+w2c2/main.c:411:                    fprintf(stderr, "w2c2: unknown option `-%c'.\n", optopt);
+w2c2/main.c:413:                    fprintf(
+w2c2/main.c:441:        fprintf(
+w2c2/main.c:453:        fprintf(
+w2c2/main.c:500:            fprintf(
+w2c2/main.c:538:            fprintf(stderr, "w2c2: failed to compile\n");
+w2c2/opcode.c:562:            fprintf(
+w2c2/opcode.c:769:            fprintf(
+w2c2/stringbuilder.c:117:    const int length = sprintf(buffer, "%u", value);
+w2c2/stringbuilder.c:127:    const int length = sprintf(buffer, "%i", value);
+w2c2/stringbuilder.c:137:    const int length = sprintf(buffer, "%llu", value);
+w2c2/stringbuilder.c:147:    const int length = sprintf(buffer, "%lli", value);
+w2c2/stringbuilder.c:157:    const int length = sprintf(buffer, "%02X", value);
+w2c2/stringbuilder.c:167:    const int length = sprintf(buffer, "%08X", value);
+w2c2/stringbuilder.c:177:    const int length = sprintf(buffer, "%016llX", value);
+w2c2/getopt_impl.h:80:        (void)printf("illegal option -- %c\n", optopt);
+w2c2/getopt_impl.h:96:        (void)printf("option requires an argument -- %c\n", optopt);
+w2c2/reader.c:370:            fprintf(
+w2c2/reader.c:488:            fprintf(
+w2c2/reader.c:546:        fprintf(stderr, "w2c2: skipping custom section '%s' (size %u)\n", name, sectionSize);
+w2c2/reader.c:1974:    fprintf(
+w2c2/debug.c:197:            fprintf(stderr, "w2c2: failed to get child DIE\n");
+w2c2/debug.c:210:            fprintf(stderr, "w2c2: failed to get DIE tag\n");
+w2c2/debug.c:229:                fprintf(stderr, "w2c2: failed to get child sibling DIE\n");
+w2c2/debug.c:250:        fprintf(stderr, "w2c2: failed to allocate DWARF interface\n");
+w2c2/debug.c:259:        fprintf(stderr, "w2c2: failed to init DWARF reader\n");
+w2c2/debug.c:284:            fprintf(stderr, "w2c2: failed to get DIE tag\n");
+w2c2/debug.c:289:            fprintf(stderr, "w2c2: unexpected non-compile unit DIE tag: %d\n", tag);
+w2c2/debug.c:295:            fprintf(stderr, "w2c2: failed to get CU DIE files\n");
+w2c2/debug.c:303:            fprintf(stderr, "w2c2: failed to get lines\n");
+w2c2/debug.c:315:                fprintf(stderr, "w2c2: failed to get line address\n");
+w2c2/debug.c:327:                fprintf(stderr, "w2c2: failed to get line source\n");
+w2c2/debug.c:336:                fprintf(stderr, "w2c2: failed to get line number\n");
+w2c2/debug.c:363:        fprintf(stderr, "w2c2: failed to finish DWARF reader\n");
+w2c2/debug.c:585:            fprintf(stderr, "w2c2: failed to get child DIE\n");
+w2c2/debug.c:598:            fprintf(stderr, "w2c2: failed to get DIE tag\n");
+w2c2/debug.c:617:                fprintf(stderr, "w2c2: failed to get child sibling DIE\n");
+w2c2/debug.c:638:        fprintf(stderr, "w2c2: failed to allocate DWARF interface\n");
+w2c2/debug.c:647:        fprintf(stderr, "w2c2: failed to init DWARF reader\n");
+w2c2/debug.c:675:            fprintf(stderr, "w2c2: failed to get DIE tag\n");
+w2c2/debug.c:680:            fprintf(stderr, "w2c2: unexpected non-compile unit DIE tag: %d\n", tag);
+w2c2/debug.c:686:            fprintf(stderr, "w2c2: failed to get CU DIE files\n");
+w2c2/debug.c:694:            fprintf(stderr, "w2c2: failed to get line context\n");
+w2c2/debug.c:700:            fprintf(stderr, "w2c2: failed to get lines from context\n");
+w2c2/debug.c:712:                fprintf(stderr, "w2c2: failed to get line address\n");
+w2c2/debug.c:724:                fprintf(stderr, "w2c2: failed to get line source\n");
+w2c2/debug.c:733:                fprintf(stderr, "w2c2: failed to get line number\n");
+w2c2/debug.c:760:        fprintf(stderr, "w2c2: failed to finish DWARF reader\n");
+w2c2/c.c:56:    fprintf(file, "%c%u", localNamePrefix, localIndex);
+w2c2/c.c:84:            fprintf(file, "%c%02X", escapeChar, c);
+w2c2/c.c:132:    fprintf(file, "%u", globalIndex);
+w2c2/c.c:217:    fprintf(file, "%u", memoryIndex);
+w2c2/c.c:237:    fprintf(file, "%s->", variableName);
+w2c2/c.c:285:    fprintf(file, "%u", tableIndex);
+w2c2/c.c:358:    fprintf(file, "%u", dataSegmentIndex);
+w2c2/c.c:381:    fprintf(file, "f%u", functionIndex);
+w2c2/c.c:449:    fprintf(
+w2c2/c.c:514:            fprintf(stderr, "w2c2: unsupported function with multiple result values\n");
+w2c2/c.c:667:        fprintf(stderr, "w2c2: invalid call instruction encoding\n");
+w2c2/c.c:763:        fprintf(stderr, "w2c2: invalid call_indirect instruction encoding\n");
+w2c2/c.c:845:        fprintf(stderr, "w2c2: invalid local.get instruction encoding\n");
+w2c2/c.c:858:            fprintf(
+w2c2/c.c:890:        fprintf(
+w2c2/c.c:907:            fprintf(
+w2c2/c.c:944:        fprintf(
+w2c2/c.c:960:            fprintf(
+w2c2/c.c:994:        fprintf(
+w2c2/c.c:1010:            fprintf(
+w2c2/c.c:1070:                /* patched: always emit the exact bit pattern (no %.9g, no float printf in the libc) */
+w2c2/c.c:1093:                /* patched: always emit the exact bit pattern (no %.17g, no float printf in the libc) */
+w2c2/c.c:1101:            fprintf(stderr, "w2c2: unsupported const type %s\n", wasmValueTypeDescription(valueType));
+w2c2/c.c:1117:        fprintf(
+w2c2/c.c:1189:        fprintf(
+w2c2/c.c:1272:                fprintf(
+w2c2/c.c:1340:        fprintf(
+w2c2/c.c:1388:                fprintf(
+w2c2/c.c:1411:        fprintf(stderr, "w2c2: invalid memory.size instruction encoding\n");
+w2c2/c.c:1418:            fprintf(
+w2c2/c.c:1464:        fprintf(stderr, "w2c2: invalid memory.grow instruction encoding\n");
+w2c2/c.c:1471:            fprintf(
+w2c2/c.c:1519:        fprintf(stderr, "w2c2: invalid memory.init instruction encoding\n");
+w2c2/c.c:1573:        fprintf(stderr, "w2c2: invalid memory.copy instruction encoding\n");
+w2c2/c.c:1581:            fprintf(
+w2c2/c.c:1591:            fprintf(
+w2c2/c.c:1656:        fprintf(stderr, "w2c2: invalid memory.fill instruction encoding\n");
+w2c2/c.c:1663:            fprintf(
+w2c2/c.c:2071:        fprintf(
+w2c2/c.c:2182:        fprintf(
+w2c2/c.c:2248:        fprintf(
+w2c2/c.c:2404:        fprintf(stderr, "w2c2: invalid br instruction encoding\n");
+w2c2/c.c:2424:        fprintf(stderr, "w2c2: invalid br.if instruction encoding\n");
+w2c2/c.c:2473:        fprintf(stderr, "w2c2: invalid br_table instruction encoding\n");
+w2c2/c.c:2596:        fprintf(
+w2c2/c.c:2711:        fprintf(
+w2c2/c.c:2735:        fprintf(
+w2c2/c.c:2759:        fprintf(
+w2c2/c.c:2784:        fprintf(
+w2c2/c.c:2840:                fprintf(
+w2c2/c.c:2850:            fprintf(
+w2c2/c.c:2880:        fprintf(
+w2c2/c.c:2928:                fprintf(
+w2c2/c.c:2938:            fprintf(
+w2c2/c.c:2963:        fprintf(
+w2c2/c.c:3235:                fprintf(
+w2c2/c.c:3245:            fprintf(
+w2c2/c.c:3303:        fprintf(
+w2c2/c.c:3359:                fprintf(
+w2c2/c.c:3369:            fprintf(
+w2c2/c.c:3674:                        fprintf(
+w2c2/c.c:3698:                        fprintf(
+w2c2/c.c:3712:                        fprintf(
+w2c2/c.c:3728:                        fprintf(
+w2c2/c.c:3742:                        fprintf(
+w2c2/c.c:3756:                        fprintf(
+w2c2/c.c:3770:                        fprintf(
+w2c2/c.c:3817:                                fprintf(
+w2c2/c.c:4287:                        fprintf(
+w2c2/c.c:4409:            fprintf(stderr, "w2c2: function with multiple return values\n");
+w2c2/c.c:4562:                fprintf(file, " __asm__(\"%s_%s\")", moduleName, functionName);
+w2c2/c.c:4603:                fprintf(file, "#line %u \"%s\"\n", (U32)debugLine->number, debugLine->path);
+w2c2/c.c:4716:                fprintf(stderr, "w2c2: invalid const instruction encoding\n");
+w2c2/c.c:4729:            fprintf(stderr, "w2c2: invalid init expression instruction %s\n", wasmOpcodeDescription(opcode));
+w2c2/c.c:4753:        fprintf(file, "static void %sInitGlobals(%sInstance* i) {\n", moduleName, moduleName);
+w2c2/c.c:4821:    fprintf(file, "resolve(\"%s\", \"%s\");\n", module, name);
+w2c2/c.c:4942:    fprintf(
+w2c2/c.c:4970:    fprintf(file, "%s_", moduleName);
+w2c2/c.c:5044:    fprintf(file, "(%sInstance* i)", moduleName);
+w2c2/c.c:5098:                fprintf(
+w2c2/c.c:5161:                            fprintf(file, "%u", value);
+w2c2/c.c:5163:                            fprintf(file, "0x%x", value);
+w2c2/c.c:5200:            fprintf(stderr, "w2c2: unsupported data segment mode: %d\n", mode);
+w2c2/c.c:5254:            fprintf(stderr, "w2c2: unsupported data segment mode: %d\n", mode);
+w2c2/c.c:5261:        fprintf(
+w2c2/c.c:5275:            fprintf(
+w2c2/c.c:5286:        fprintf(
+w2c2/c.c:5359:        fprintf(
+w2c2/c.c:5384:                        fprintf(file, "= WASM_MEMORY_ALLOCATE_SHARED(%u, %u);\n", memory.min, memory.max);
+w2c2/c.c:5409:                    fprintf(file, " = wasmMemoryAllocate(%u, %u, false);\n", memory.min, memory.max);
+w2c2/c.c:5432:                                fprintf(file, " = ds + %llu", byteOffset);
+w2c2/c.c:5434:                                fprintf(file, "=ds+%llu", byteOffset);
+w2c2/c.c:5466:                                fprintf(file, ", ds+%llu", byteOffset);
+w2c2/c.c:5473:                        fprintf(file, ", %lu);\n", (unsigned long) dataSegmentLength);
+w2c2/c.c:5571:        fprintf(file, "static void %sInitTables(%sInstance* i) {\n", moduleName, moduleName);
+w2c2/c.c:5590:                fprintf(file, ", %u, %u);\n", table.min, table.max);
+w2c2/c.c:5622:                            fprintf(file, ".data[offset + %u] = (wasmFunc)", functionIndexIndex);
+w2c2/c.c:5624:                            fprintf(file, ".data[offset+%u]=(wasmFunc)", functionIndexIndex);
+w2c2/c.c:5699:    fprintf(file, "#include \"%s\"\n\n", headerName);
+w2c2/c.c:5710:    fprintf(file, "typedef struct %sInstance {\n", moduleName);
+w2c2/c.c:5725:    fprintf(file, "} %sInstance;\n\n", moduleName);
+w2c2/c.c:5754:    fprintf(
+w2c2/c.c:5766:    fprintf(
+w2c2/c.c:5792:    fprintf(file, "%sInitImports(child, self->common.resolveImports);\n", moduleName);
+w2c2/c.c:5798:        fprintf(file, "%sInitMemories(child, self);\n", moduleName);
+w2c2/c.c:5807:        fprintf(file, "%sInitTables(child);\n", moduleName);
+w2c2/c.c:5814:        fprintf(file, "%sInitGlobals(child);\n", moduleName);
+w2c2/c.c:5843:    fprintf(
+w2c2/c.c:5853:    fprintf(file, "i->common.funcExports = %sFuncExports;\n", moduleName);
+w2c2/c.c:5863:    fprintf(file, "i->common.newChild = (struct wasmModuleInstance* (*)(struct wasmModuleInstance*))%sNewChild;\n", moduleName);
+w2c2/c.c:5868:    fprintf(file, "%sInitImports(i, resolveImports);\n", moduleName);
+w2c2/c.c:5874:        fprintf(file, "%sInitMemories(i, NULL);\n", moduleName);
+w2c2/c.c:5883:        fprintf(file, "%sInitTables(i);\n", moduleName);
+w2c2/c.c:5890:        fprintf(file, "%sInitGlobals(i);\n", moduleName);
+w2c2/c.c:5912:    fprintf(file, "void %sFreeInstance(%sInstance* i) {\n", moduleName, moduleName);
+w2c2/c.c:5936:        fprintf(
+w2c2/c.c:5945:    fprintf(file, "#ifndef %s_H\n", moduleName);
+w2c2/c.c:5946:    fprintf(file, "#define %s_H\n\n", moduleName);
+w2c2/c.c:5952:    fprintf(
+w2c2/c.c:5958:    fprintf(
+w2c2/c.c:5967:    fprintf(file, "#endif /* %s_H */\n\n", moduleName);
+w2c2/c.c:5970:        fprintf(
+w2c2/c.c:6003:    fprintf(
+w2c2/c.c:6027:            fprintf(file, ",\"%s\"},\n", export.name);
+w2c2/c.c:6094:    sprintf(filename, "%c%010u.c", filePrefix, fileIndex);
+w2c2/c.c:6097:        fprintf(
+w2c2/c.c:6122:        fprintf(
+w2c2/c.c:6244:                    fprintf(
+w2c2/c.c:6314:                fprintf(
+w2c2/c.c:6386:                fprintf(stderr, "w2c2: failed to join writer thread: %s\n", strerror(err));
+w2c2/c.c:6417:        fprintf(
+w2c2/c.c:6444:            fprintf(stderr, "w2c2: unsupported data segment mode: %d\n", options.dataSegmentMode);
+w2c2/c.c:6509:        fprintf(
+
+exec
+/bin/bash -lc "sed -n '1500,1570p' w2c2/c.c; nl -ba w2c2/file.c; nl -ba w2c2/array.c; nl -ba w2c2/stringbuilder.c | sed -n '1,55p'; nl -ba w2c2/reader.c | sed -n '325,380p'; nl -ba w2c2/main.c | sed -n '100,150p'; nl -ba Makefile | sed -n '1,260p'" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+                writer->builder,
+                stackIndex0,
+                writer->typeStack->valueTypes[stackIndex0]
+            ))
+            MUST (wasmCWrite(writer, ");\n"))
+        }
+    }
+
+    return true;
+}
+
+static
+bool
+WARN_UNUSED_RESULT
+wasmCWriteMemoryInitExpr(
+    const WasmCFunctionWriter* writer
+) {
+    WasmMemoryInitInstruction instruction;
+    if (!wasmMemoryInitInstructionRead(writer->code, &instruction)) {
+        fprintf(stderr, "w2c2: invalid memory.init instruction encoding\n");
+        return false;
+    }
+
+    if (!writer->ignore) {
+        const U32 stackIndex0 = wasmTypeStackGetTopIndex(writer->typeStack, 0);
+        const U32 stackIndex1 = wasmTypeStackGetTopIndex(writer->typeStack, 1);
+        const U32 stackIndex2 = wasmTypeStackGetTopIndex(writer->typeStack, 2);
+
+        MUST (wasmCWriteIndent(writer))
+        MUST (wasmCWrite(writer, "LOAD_DATA("))
+        MUST (wasmCWriteStringMemoryUse(
+            writer->builder,
+            writer->module,
+            instruction.memoryIndex,
+            false
+        ))
+        MUST (wasmCWriteComma(writer))
+        MUST (wasmCWriteStringStackName(
+            writer->builder,
+            stackIndex2,
+            writer->typeStack->valueTypes[stackIndex2]
+        ))
+        MUST (wasmCWriteComma(writer))
+        /* TODO: add support for multiple modules */
+        MUST (wasmCWriteStringDataSegmentName(writer->builder, instruction.dataSegmentIndex))
+        MUST (wasmCWriteChar(writer, '+'))
+        MUST (wasmCWriteStringStackName(
+            writer->builder,
+            stackIndex1,
+            writer->typeStack->valueTypes[stackIndex1]
+        ))
+        MUST (wasmCWriteComma(writer))
+        MUST (wasmCWriteStringStackName(
+            writer->builder,
+            stackIndex0,
+            writer->typeStack->valueTypes[stackIndex0]
+        ))
+        MUST (wasmCWrite(writer, ");\n"))
+
+        wasmTypeStackDrop(writer->typeStack, 3);
+    }
+
+    return true;
+}
+
+static
+bool
+WARN_UNUSED_RESULT
+wasmCWriteMemoryCopyExpr(
+    const WasmCFunctionWriter* writer
+) {
+     1	#include <stdio.h>
+     2	#include <stdlib.h>
+     3	#include "w2c2_base.h"
+     4	#include "file.h"
+     5	
+     6	Buffer
+     7	readFile(
+     8	    const char* path
+     9	) {
+    10	    FILE* file = NULL;
+    11	    Buffer buffer = {NULL, 0};
+    12	    U8* data = NULL;
+    13	    size_t size = 0;
+    14	    size_t read = 0;
+    15	
+    16	    file = fopen(path, "rb");
+    17	    if (file == NULL) {
+    18	        return buffer;
+    19	    }
+    20	    fseek(file, 0, SEEK_END);
+    21	
+    22	    size = (size_t) ftell(file);
+    23	    rewind(file);
+    24	
+    25	    data = malloc(size);
+    26	    if (data == NULL) {
+    27	        return buffer;
+    28	    }
+    29	    read = fread(data, 1, size, file);
+    30	    if (read == size) {
+    31	        buffer.data = data;
+    32	        buffer.length = size;
+    33	    } else {
+    34	        free(data);
+    35	    }
+    36	    fclose(file);
+    37	
+    38	    return buffer;
+    39	}
+     1	#include <assert.h>
+     2	#include "array.h"
+     3	
+     4	bool
+     5	arrayEnsureCapacitySlowPath(
+     6	    void** items,
+     7	    const size_t length,
+     8	    size_t* capacity,
+     9	    const size_t itemSize
+    10	) {
+    11	    size_t newCapacity = 0;
+    12	    void* newItems = NULL;
+    13	
+    14	    assert(length > *capacity);
+    15	
+    16	    newCapacity = length + (*capacity >> 1U);
+    17	    if (*items == NULL) {
+    18	        newItems = calloc(newCapacity, itemSize);
+    19	    } else {
+    20	        newItems = realloc(*items, newCapacity * itemSize);
+    21	    }
+    22	    if (newItems == NULL) {
+    23	        return false;
+    24	    }
+    25	
+    26	    *items = newItems;
+    27	    *capacity = newCapacity;
+    28	
+    29	    return true;
+    30	}
+     1	#include <stdlib.h>
+     2	#include <string.h>
+     3	#include <stdio.h>
+     4	#include "stringbuilder.h"
+     5	
+     6	static
+     7	bool
+     8	WARN_UNUSED_RESULT
+     9	stringBuilderEnsureCapacity(
+    10	    StringBuilder* stringBuilder,
+    11	    const size_t length
+    12	) {
+    13	    const size_t lengthWithNull = length + 1;
+    14	    if (lengthWithNull > stringBuilder->capacity) {
+    15	        const size_t newCapacity = lengthWithNull + (stringBuilder->capacity >> 1U);
+    16	        void* newString = realloc(stringBuilder->string, newCapacity);
+    17	        MUST (newString != NULL)
+    18	        stringBuilder->string = (char*) newString;
+    19	        stringBuilder->capacity = newCapacity;
+    20	    }
+    21	    return true;
+    22	}
+    23	
+    24	bool
+    25	WARN_UNUSED_RESULT
+    26	stringBuilderInitialize(
+    27	    StringBuilder* stringBuilder
+    28	) {
+    29	    static const size_t initialCapacity = sizeof(char) * 8;
+    30	    void* newString = NULL;
+    31	    MUST (stringBuilder->string == NULL)
+    32	    newString = malloc(initialCapacity);
+    33	    MUST (newString != NULL)
+    34	
+    35	    stringBuilder->length = 0;
+    36	    stringBuilder->capacity = initialCapacity;
+    37	    stringBuilder->string = (char*) newString;
+    38	    stringBuilder->string[0] = '\0';
+    39	
+    40	    return true;
+    41	}
+    42	
+    43	bool
+    44	WARN_UNUSED_RESULT
+    45	stringBuilderReset(
+    46	    StringBuilder* stringBuilder
+    47	) {
+    48	    if (stringBuilder->capacity < 1) {
+    49	        MUST (stringBuilderInitialize(stringBuilder))
+    50	    }
+    51	
+    52	    stringBuilder->length = 0;
+    53	    stringBuilder->string[0] = '\0';
+    54	
+    55	    return true;
+   325	wasmFunctionNameEntryCompareNames(
+   326	    const void* a,
+   327	    const void* b
+   328	) {
+   329	    const WasmFunctionNameEntry* entryA = a;
+   330	    const WasmFunctionNameEntry* entryB = b;
+   331	    return strcmp(entryA->name, entryB->name);
+   332	}
+   333	
+   334	static
+   335	void
+   336	wasmFunctionNamesRemoveDuplicates(
+   337	    const WasmNames* functionNames,
+   338	    WasmModuleReaderError** error
+   339	) {
+   340	    const size_t functionNameCount = functionNames->length;
+   341	    U32 functionNameIndex = 0;
+   342	
+   343	    WasmFunctionNameEntry* entries = calloc(functionNameCount, sizeof(WasmFunctionNameEntry));
+   344	    if (!entries) {
+   345	        static WasmModuleReaderError wasmModuleReaderError = {
+   346	            wasmModuleReaderAllocationFailed
+   347	        };
+   348	        *error = &wasmModuleReaderError;
+   349	        return;
+   350	    }
+   351	
+   352	    for (; functionNameIndex < functionNameCount; functionNameIndex++) {
+   353	        WasmFunctionNameEntry *entry = &entries[functionNameIndex];
+   354	        entry->functionIndex = functionNameIndex;
+   355	        entry->name = functionNames->names[functionNameIndex];
+   356	    }
+   357	
+   358	    qsort(
+   359	        entries,
+   360	        functionNameCount,
+   361	        sizeof(WasmFunctionNameEntry),
+   362	        wasmFunctionNameEntryCompareNames
+   363	    );
+   364	
+   365	    for (functionNameIndex = 1; functionNameIndex < functionNameCount; functionNameIndex++) {
+   366	        const WasmFunctionNameEntry previous = entries[functionNameIndex - 1];
+   367	        const WasmFunctionNameEntry current = entries[functionNameIndex];
+   368	
+   369	        if (strcmp(previous.name, current.name) == 0) {
+   370	            fprintf(
+   371	                stderr,
+   372	                "w2c2: ignoring duplicate function name %s used by functions %u and %u\n",
+   373	                previous.name,
+   374	                previous.functionIndex,
+   375	                current.functionIndex
+   376	            );
+   377	
+   378	            functionNames->names[previous.functionIndex] = NULL;
+   379	            functionNames->names[current.functionIndex] = NULL;
+   380	        }
+   100	        moduleName[j++] = modulePath[i];
+   101	    }
+   102	    moduleName[j] = '\0';
+   103	}
+   104	
+   105	static
+   106	int
+   107	wasmFunctionIDsCompareHashes(
+   108	    const void* a,
+   109	    const void* b
+   110	) {
+   111	    const WasmFunctionID* functionIDA = a;
+   112	    const WasmFunctionID* functionIDB = b;
+   113	    const int c = memcmp(functionIDA->hash, functionIDB->hash, SHA1_DIGEST_LENGTH);
+   114	    /* patched: total order (tie-break on index) so output does not depend on qsort stability */
+   115	    if (c != 0) {
+   116	        return c;
+   117	    }
+   118	    return functionIDA->functionIndex < functionIDB->functionIndex ? -1
+   119	         : functionIDA->functionIndex > functionIDB->functionIndex ? 1 : 0;
+   120	}
+   121	
+   122	WasmFunctionIDs
+   123	wasmSortedFunctionIDs(
+   124	    const WasmFunctions functions
+   125	) {
+   126	    WasmFunctionIDs result = emptyWasmFunctionIDs;
+   127	
+   128	    U32 functionIndex = 0;
+   129	    for (; functionIndex < functions.count; functionIndex++) {
+   130	        const WasmFunction function = functions.functions[functionIndex];
+   131	        WasmFunctionID functionID = emptyWasmFunctionID;
+   132	        memcpy(functionID.hash, function.hash, SHA1_DIGEST_LENGTH);
+   133	        functionID.functionIndex = functionIndex;
+   134	        if (!wasmFunctionIDsAppend(&result, functionID)) {
+   135	            exit(1);
+   136	        }
+   137	    }
+   138	
+   139	    if (result.length > 1) {
+   140	        qsort(
+   141	            result.functionIDs,
+   142	            result.length,
+   143	            sizeof(WasmFunctionID),
+   144	            wasmFunctionIDsCompareHashes
+   145	        );
+   146	    }
+   147	
+   148	    return result;
+   149	}
+   150	
+     1	# Pipeline: guest/X.c --clang(untrusted)--> build/X.wasm --w2c2--> build/X/guest.c --tcc--> build/X/sandbox
+     2	WCC = clang --target=wasm32 -O2 -nostdlib -ffreestanding -fno-builtin -Wall -Wno-empty-body
+     3	WLD = -Wl,--no-entry -Wl,--export=_start -Wl,--export=memory -Wl,--allow-undefined \
+     4	      -Wl,--initial-memory=1048576 -Wl,--max-memory=16777216 -Wl,-z,stack-size=65536
+     5	GUESTS = cat rot13 evil grow escape
+     6	W2C2 ?= $(HOME)/src/w2c2/w2c2/w2c2
+     7	TCC = tcc
+     8	ARENA_PAGES ?= 256
+     9	
+    10	all: $(GUESTS:%=build/%/sandbox) build/control build/escape/sandbox-demo
+    11	
+    12	build/escape/sandbox-demo: build/escape/guest.c host/main.c rt/w2c2_base.h
+    13		$(TCC) -nostdlib -static -nostdinc -Irt -Ibuild/escape -DARENA_PAGES=$(ARENA_PAGES) -DDEMO_ESCAPE -o $@ host/main.c $<
+    14	
+    15	build/%.wasm: guest/%.c libc/libc.c libc/libc.h
+    16		@mkdir -p build
+    17		$(WCC) $(WLD) -o $@ guest/$*.c libc/libc.c
+    18	
+    19	build/%/guest.c: build/%.wasm
+    20		@mkdir -p build/$*
+    21		cp $< build/$*/guest.wasm
+    22		$(W2C2) build/$*/guest.wasm $@
+    23	
+    24	build/%/sandbox: build/%/guest.c host/main.c rt/w2c2_base.h
+    25		$(TCC) -nostdlib -static -nostdinc -Irt -Ibuild/$* -DARENA_PAGES=$(ARENA_PAGES) -o $@ host/main.c $<
+    26	
+    27	build/control: control/main.go
+    28		cd control && go build -o ../build/control .
+    29	
+    30	clean:
+    31		rm -rf build
+    32	.PHONY: all clean
+    33	.SECONDARY:
+    34	
+    35	# ---- Experiment 2: w2c2 itself as a guest ----
+    36	W2C2_SRC = $(filter-out w2c2/main.c, $(wildcard w2c2/*.c)) w2c2/main.c
+    37	W2C2_CFLAGS = -std=c89 -Wno-long-long -DHAS_UNISTD=1
+    38	W2C2_WLD = -Wl,--no-entry -Wl,--export=_start -Wl,--export=memory -Wl,--allow-undefined \
+    39	      -Wl,--initial-memory=4194304 -Wl,--max-memory=268435456 -Wl,-z,stack-size=1048576
+    40	
+    41	# native w2c2 from the vendored, patched source (build tool; compiled with clang)
+    42	build/w2c2-native: $(W2C2_SRC) $(wildcard w2c2/*.h)
+    43		@mkdir -p build
+    44		clang -O2 $(W2C2_CFLAGS) -Wno-unused-function -o $@ $(W2C2_SRC)
+    45	
+    46	build/w2c2.wasm: $(W2C2_SRC) $(wildcard w2c2/*.h) libc/libc.c libc/stdio.c $(wildcard libc/include/*.h)
+    47		@mkdir -p build
+    48		$(WCC) -nostdinc -Ilibc/include $(W2C2_CFLAGS) -Wno-unused-function -DGUEST_ARGV='"w2c2","guest.wasm","guest.c"' \
+    49		    $(W2C2_WLD) -o $@ $(W2C2_SRC) libc/libc.c libc/stdio.c
+    50	
+    51	build/w2c2/sandbox: build/w2c2.wasm host/main.c rt/w2c2_base.h build/w2c2-native
+    52		@mkdir -p build/w2c2
+    53		cp build/w2c2.wasm build/w2c2/guest.wasm
+    54		./build/w2c2-native build/w2c2/guest.wasm build/w2c2/guest.c
+    55		$(TCC) -nostdlib -static -nostdinc -Irt -Ibuild/w2c2 -DARENA_PAGES=4096 -o $@ host/main.c build/w2c2/guest.c
+
+codex
+# Security review: sandboxed execution stack
+
+## Executive summary
+
+The seccomp boundary is effective for syscall confinement: the release binaries are static, contain one `syscall` instruction in `sys3`, and host code after `prctl` only requests `read`, `write`, or `exit`.
+
+However, arbitrary Wasm is **not currently memory-safe after translation**. I found two critical generated-code paths that bypass the runtime’s checked accessors:
+
+1. `memory.init` checks the destination but not the source data-segment range, permitting reads from arbitrary host memory.
+2. Active element-segment initialization writes directly into the function table without checking the offset or length, permitting writes outside the table arena.
+
+There is also no `call_indirect` signature check. That is C undefined behavior and prevents treating indirect calls as safely confined, even after the table-write bug is fixed.
+
+## Findings
+
+### Critical: `memory.init` can read outside its data segment
+
+Locations:
+
+- `w2c2/c.c:1530-1559`
+- `rt/w2c2_base.h:137`
+
+Generated `memory.init` has this shape:
+
+```c
+LOAD_DATA(memory, destination, data_segment + source, length);
+```
+
+`LOAD_DATA` performs only:
+
+```c
+wasm_check(&(m), destination, length);
+memcpy(&m.data[destination], source_pointer, length);
+```
+
+The guest controls `source` and `length`, but there is no check that:
+
+```text
+source + length <= data_segment_length
+```
+
+Consequently, a malicious module can use `memory.init` to copy bytes following the generated static data-segment array into linear memory. It can then send those bytes through `env.write`. This is a host-memory disclosure primitive, even though seccomp still prevents opening files or making other syscalls.
+
+The source-pointer expression can itself run outside the C array before `memcpy` begins, which is also C undefined behavior.
+
+Suggested fix:
+
+- Represent passive data segments as `{ pointer, length, dropped }`.
+- Replace `LOAD_DATA` for `memory.init` with a helper accepting the segment and source offset separately.
+- Check both ranges using widened arithmetic:
+
+```c
+if ((U64)source + length > segment.length)
+    trap(trapOutOfBoundsMemory);
+wasm_check(memory, destination, length);
+```
+
+- Implement `data.drop`, and make subsequent non-empty `memory.init` operations trap.
+- Keep a separate checked helper for active data-segment initialization, whose source offset is always zero.
+
+### Critical: active element segments write outside the table arena
+
+Locations:
+
+- `w2c2/c.c:5595-5625`
+- Example generated writes: `build/w2c2/guest.c:54542-54560`
+- `rt/w2c2_base.h:172-180`
+
+w2c2 emits active element initialization as unchecked native C assignments:
+
+```c
+offset = ...;
+i->t0.data[offset + 0] = (wasmFunc)&f76;
+```
+
+Neither the generated code nor the header verifies that the full element segment fits in `t->size`. The `offset + element_index` expression also uses `U32`, so it can wrap.
+
+A malicious active element segment can therefore write function addresses before or after `wasm_table_arena`. Depending on link layout, this can corrupt runtime globals, instance state, or other host data. This is a host-memory write primitive generated directly from attacker-controlled Wasm.
+
+`wasm_table_get` does not mitigate this because it protects table reads during `call_indirect`, not initialization writes.
+
+Suggested fix:
+
+- Add a checked table initialization helper, for example:
+
+```c
+wasmTableInit(table, offset, functions, count);
+```
+
+- Validate the whole range with widened arithmetic:
+
+```c
+if ((U64)offset + count > table->size)
+    trap(trapOutOfBoundsTable);
+```
+
+- Do not emit direct `.data[offset + n]` assignments.
+- Use equivalent checked helpers for any future `table.init`, `table.copy`, `table.fill`, `table.set`, and `table.grow` support.
+
+### High: `call_indirect` has no function-type check
+
+Locations:
+
+- `rt/w2c2_base.h:167-182`
+- Examples: `build/w2c2/guest.c:15754`, `build/w2c2/guest.c:47187`
+
+`TF` verifies the table index and nullness, then casts the stored generic function pointer to the signature requested by the call site:
+
+```c
+#define TF(table, index, t) ((t)wasm_table_get(&(table), (index)))
+```
+
+Wasm requires `call_indirect` to trap when the selected function’s type does not match the instruction’s expected type. Here, an attacker can call a legitimate generated function through an incompatible C function-pointer type.
+
+Calling through an incompatible function type is undefined behavior in C. On the current x86-64/tcc combination it will often only scramble arguments or return values, but that is not a defensible security property and may become exploitable as generated shapes or compiler behavior change.
+
+Suggested fix:
+
+- Store `{ function_pointer, type_id }` in each table slot.
+- Have the generator assign a canonical type ID to every Wasm function signature.
+- Pass the expected type ID into `wasm_table_get` and trap on mismatch before casting/calling.
+- Avoid using a bare `void (*)(void)` as the complete table representation.
+
+### Medium: table maximum is not checked against the arena
+
+Location: `rt/w2c2_base.h:172-175`
+
+`wasmTableAllocate` checks `size > wasm_table_arena_size`, but accepts an arbitrarily larger `maxSize`:
+
+```c
+if (t->data || size > wasm_table_arena_size)
+    trap(...);
+t->maxSize = maxSize;
+```
+
+There is currently no table-growth helper, so this is not directly exploitable by the supplied generated files. It becomes an overflow risk as soon as `table.grow` is supported, and leaves the runtime object claiming capacity that cannot exist.
+
+Suggested fix:
+
+```c
+if (t->data ||
+    size > maxSize ||
+    maxSize > wasm_table_arena_size)
+    trap(trapAllocationFailed);
+```
+
+### Medium: 4 GiB linear memory wraps `wasmMemory.size` to zero
+
+Locations:
+
+- `rt/w2c2_base.h:103`
+- `rt/w2c2_base.h:109-124`
+
+`size` is `U32`, and is calculated as:
+
+```c
+m->size = pages * 65536;
+```
+
+At the Wasm32 architectural limit of 65,536 pages, the byte size is exactly 2³² and becomes zero in `U32`. All accesses then trap incorrectly.
+
+The configured builds use at most 4,096 pages, so this does not affect the current artifacts. It is nevertheless a latent correctness issue if `ARENA_PAGES` is raised.
+
+Suggested fix:
+
+- Store the current byte length as `U64` or host `size_t`.
+- Widen before multiplication:
+
+```c
+m->size = (U64)pages * WASM_PAGE_SIZE;
+```
+
+- Apply the same rule when validating arena configuration.
+
+### Medium: Wasm effective-address overflow has incorrect semantics
+
+Generated access examples culminate in checked helpers such as:
+
+- `build/w2c2/guest.c:54523-54525`
+- Emitter: `w2c2/c.c:1145-1170`, `w2c2/c.c:1295-1318`
+
+w2c2 computes a load/store effective address as `U32 base + constant_offset` before passing it to the checked accessor. That addition can wrap to a small in-bounds address.
+
+This does not escape the arena, because the wrapped address is still checked, but it violates Wasm semantics: the operation should trap when the mathematical effective address exceeds the current memory.
+
+Suggested fix:
+
+- Pass base and static offset separately to the accessor, or compute in `U64`.
+- Trap if the full widened `base + offset + access_size` exceeds memory size.
+
+## Host and seccomp audit
+
+### No unintended post-seccomp syscalls found
+
+Relevant locations:
+
+- Seccomp entry: `host/main.c:63-68`
+- Guest execution: `host/main.c:68-70`
+- Raw syscall wrapper: `host/main.c:19-23`
+- Exit path: `host/main.c:24-25`
+
+After successful `PR_SET_SECCOMP`, the host performs:
+
+1. `guestInstantiate`
+2. `guest__start`
+3. raw `SYS_exit`
+
+The release artifacts inspected were static ELF executables with no dynamic section or unresolved symbols. Disassembly of both:
+
+- `build/rot13/sandbox`
+- `build/w2c2/sandbox`
+
+showed exactly one `syscall` instruction, inside the shared `sys3` wrapper. There were no `int 0x80` or `sysenter` sites.
+
+Thus, tcc has not inserted startup, TLS, allocator, stack-protector, or arithmetic-helper syscalls into these binaries. `memcpy`, `memmove`, and `memset` are host-provided loops. Generated `NewChild` can reach `calloc`, but the host implementation traps rather than allocating.
+
+The `DEMO_ESCAPE` configuration at `host/main.c:52-54` deliberately requests `getpid`; it must remain excluded from production builds. Strict seccomp kills it as expected.
+
+Even if memory corruption obtains arbitrary native control flow, strict seccomp should continue to reject other syscalls. The memory-safety findings still permit disclosure/corruption of process memory and invalidate the intended C-level sandbox boundary.
+
+## Guest libc correctness and determinism
+
+### High: allocation-size multiplication overflows in `calloc`
+
+Location: `libc/libc.c:28-31`
+
+```c
+void* p = malloc(n * m);
+if (p) memset(p, 0, n * m);
+```
+
+The multiplication is unchecked. A wrapped product allocates and clears a smaller block than the caller requested. w2c2 uses `calloc(count, element_size)` for attacker-controlled module counts, so a crafted input can turn this into guest-memory corruption during translation.
+
+Although guest-memory corruption remains inside the outer arena once the runtime issues are fixed, it can make the generated output incorrect or non-reproducible.
+
+Suggested fix:
+
+```c
+if (m && n > SIZE_MAX / m)
+    return NULL;
+size_t total = n * m;
+```
+
+### High: `fopen` and buffered writes discard failed `realloc` results
+
+Locations:
+
+- `libc/stdio.c:18-35`
+- `libc/stdio.c:39-46`
+
+Examples:
+
+```c
+f->cap *= 2;
+f->buf = realloc(f->buf, f->cap);
+```
+
+On failure, the old pointer is lost and execution continues with `NULL`. Capacity doubling and `f->len + total` can also wrap. Similar unchecked allocations occur for `f->name` and the initial buffers.
+
+For a sufficiently large or adversarial Wasm input/output, native w2c2 returns an allocation error or write failure, while guest w2c2 can trap, corrupt its heap, or emit truncated/different C.
+
+Suggested fix:
+
+- Check every allocation.
+- Store `realloc` into a temporary.
+- Check capacity addition and doubling for overflow.
+- Preserve the original object on failure and propagate an error.
+
+### Medium: `realloc` does not implement standard zero-size behavior
+
+Location: `libc/libc.c:33-41`
+
+For `realloc(p, 0)`, the code returns `p` because `0 <= old`. C permits implementation variation around zero-size allocation, so this alone is not necessarily invalid, but it can differ from the native libc and complicate cross-platform behavior.
+
+More importantly, `realloc` trusts the 16-byte-preceding size header without validating that `p` is an allocator result. That is acceptable only if this libc is explicitly treated as unsafe guest code, not as a general memory-safety boundary.
+
+Suggested fix:
+
+- Define and document one intentional zero-size policy.
+- Consider allocating zero as a minimum-sized object or returning `NULL`.
+- If malformed guest pointers must be diagnosed, track heap bounds and validate alignment/header range.
+
+### Medium: `fread(..., size = 0, ...)` divides by zero
+
+Location: `libc/stdio.c:48-55`
+
+The return statement is:
+
+```c
+return total / sz;
+```
+
+When `sz == 0`, standard `fread` must return zero, but this implementation divides by zero.
+
+Suggested fix:
+
+```c
+if (sz == 0 || n == 0)
+    return 0;
+```
+
+Also check multiplication overflow in `sz * n`.
+
+### Medium: `fseek` accepts invalid and out-of-range positions
+
+Locations:
+
+- `libc/stdio.c:56-61`
+- Consequence: `libc/stdio.c:51`
+
+`fseek` always succeeds and computes:
+
+```c
+f->pos = base + (size_t)off;
+```
+
+Negative offsets can wrap, invalid `whence` is treated as `SEEK_END`, and positions beyond the buffer are accepted. A later `fread` evaluates `f->len - f->pos`, which can underflow and produce an oversized copy.
+
+The current w2c2 `readFile` path uses only the valid sequence `SEEK_END`, `ftell`, `rewind`, but this FILE layer is not generally correct.
+
+Suggested fix:
+
+- Reject invalid `whence`.
+- Compute signed offsets without unsigned conversion.
+- Reject negative resulting positions.
+- In `fread`, first handle `pos >= len`.
+- Decide explicitly whether seeking past end is supported for output streams.
+
+### Low: negative zero-padding in `printf` is incorrect
+
+Locations: `libc/stdio.c:100-117`
+
+The sign is placed inside `body`, while padding is emitted before the body. Thus:
+
+```c
+sprintf(buf, "%05d", -12)
+```
+
+produces `00-12` instead of `-0012`.
+
+Numeric precision is also parsed but ignored, and the `0` flag is not disabled by `-` or numeric precision as required by standard `printf`.
+
+This does not appear to affect current w2c2 code generation: its zero-padded formats are unsigned hexadecimal (`%02X`, `%08X`, `%016llX`). It can affect diagnostics or future generator changes.
+
+Suggested fix:
+
+- Emit the sign before zero padding.
+- Implement numeric precision separately from field width.
+- Make `-` override `0`.
+
+### Low: `qsort` is deterministic for current uses, but artificially limited
+
+Location: `libc/stdio.c:159-167`
+
+The stable insertion sort is deterministic, and the important function-hash comparator now has an explicit index tie-break at `w2c2/main.c:107-119`. I found no present output nondeterminism caused by sorting.
+
+However, `qsort` aborts for element sizes above 64 bytes:
+
+```c
+char tmp[64];
+if (size > sizeof tmp) abort();
+```
+
+That is not a conforming general `qsort`. It also lacks overflow checks for `i * size`.
+
+Suggested fix:
+
+- Allocate the temporary element dynamically, or perform byte-wise rotation without a fixed limit.
+- Guard index multiplication.
+- Keep total-order comparator tie-breakers; do not depend on sort stability for reproducible output.
+
+## TCB reduction opportunities
+
+- The generated guest C is large but is not conceptually a trusted library; the trusted property should instead be established by a small, complete set of checked runtime primitives. Direct element writes and unchecked data-segment pointers currently break that abstraction.
+- `w2c2/debug.c` and DWARF machinery are compiled but inactive without libdwarf.
+- Thread, WASI, multi-module, cleanup/glob, and platform compatibility paths are unnecessary for the fixed wasm32-to-C build.
+- tcc’s in-memory execution, archive/tooling, assembler, and other unused front-end paths can be removed from a purpose-built translator compiler.
+- Generated `NewChild`, export metadata, resolver callbacks, free-instance code, and host `calloc` are unnecessary if the sandbox only instantiates one fixed module with three statically linked imports. Removing their generation would reduce both code size and callable surface.
+- The FILE abstraction contains substantially more behavior than the translator needs. A fixed stdin-backed input object and framed stdout output object would be smaller and easier to make overflow-safe.
+
+## Recommended remediation order
+
+1. Fix checked data-segment source ranges for `memory.init`.
+2. Replace direct element-segment table writes with checked initialization.
+3. Add `call_indirect` type IDs and signature validation.
+4. Add adversarial regression modules for all three cases.
+5. Fix guest-libc allocation and FILE arithmetic.
+6. Correct 4 GiB memory accounting and effective-address semantics.
+7. Trim unused w2c2/tcc/runtime features only after the safety boundary is complete.
+tokens used
+48,658
+# Security review: sandboxed execution stack
+
+## Executive summary
+
+The seccomp boundary is effective for syscall confinement: the release binaries are static, contain one `syscall` instruction in `sys3`, and host code after `prctl` only requests `read`, `write`, or `exit`.
+
+However, arbitrary Wasm is **not currently memory-safe after translation**. I found two critical generated-code paths that bypass the runtime’s checked accessors:
+
+1. `memory.init` checks the destination but not the source data-segment range, permitting reads from arbitrary host memory.
+2. Active element-segment initialization writes directly into the function table without checking the offset or length, permitting writes outside the table arena.
+
+There is also no `call_indirect` signature check. That is C undefined behavior and prevents treating indirect calls as safely confined, even after the table-write bug is fixed.
+
+## Findings
+
+### Critical: `memory.init` can read outside its data segment
+
+Locations:
+
+- `w2c2/c.c:1530-1559`
+- `rt/w2c2_base.h:137`
+
+Generated `memory.init` has this shape:
+
+```c
+LOAD_DATA(memory, destination, data_segment + source, length);
+```
+
+`LOAD_DATA` performs only:
+
+```c
+wasm_check(&(m), destination, length);
+memcpy(&m.data[destination], source_pointer, length);
+```
+
+The guest controls `source` and `length`, but there is no check that:
+
+```text
+source + length <= data_segment_length
+```
+
+Consequently, a malicious module can use `memory.init` to copy bytes following the generated static data-segment array into linear memory. It can then send those bytes through `env.write`. This is a host-memory disclosure primitive, even though seccomp still prevents opening files or making other syscalls.
+
+The source-pointer expression can itself run outside the C array before `memcpy` begins, which is also C undefined behavior.
+
+Suggested fix:
+
+- Represent passive data segments as `{ pointer, length, dropped }`.
+- Replace `LOAD_DATA` for `memory.init` with a helper accepting the segment and source offset separately.
+- Check both ranges using widened arithmetic:
+
+```c
+if ((U64)source + length > segment.length)
+    trap(trapOutOfBoundsMemory);
+wasm_check(memory, destination, length);
+```
+
+- Implement `data.drop`, and make subsequent non-empty `memory.init` operations trap.
+- Keep a separate checked helper for active data-segment initialization, whose source offset is always zero.
+
+### Critical: active element segments write outside the table arena
+
+Locations:
+
+- `w2c2/c.c:5595-5625`
+- Example generated writes: `build/w2c2/guest.c:54542-54560`
+- `rt/w2c2_base.h:172-180`
+
+w2c2 emits active element initialization as unchecked native C assignments:
+
+```c
+offset = ...;
+i->t0.data[offset + 0] = (wasmFunc)&f76;
+```
+
+Neither the generated code nor the header verifies that the full element segment fits in `t->size`. The `offset + element_index` expression also uses `U32`, so it can wrap.
+
+A malicious active element segment can therefore write function addresses before or after `wasm_table_arena`. Depending on link layout, this can corrupt runtime globals, instance state, or other host data. This is a host-memory write primitive generated directly from attacker-controlled Wasm.
+
+`wasm_table_get` does not mitigate this because it protects table reads during `call_indirect`, not initialization writes.
+
+Suggested fix:
+
+- Add a checked table initialization helper, for example:
+
+```c
+wasmTableInit(table, offset, functions, count);
+```
+
+- Validate the whole range with widened arithmetic:
+
+```c
+if ((U64)offset + count > table->size)
+    trap(trapOutOfBoundsTable);
+```
+
+- Do not emit direct `.data[offset + n]` assignments.
+- Use equivalent checked helpers for any future `table.init`, `table.copy`, `table.fill`, `table.set`, and `table.grow` support.
+
+### High: `call_indirect` has no function-type check
+
+Locations:
+
+- `rt/w2c2_base.h:167-182`
+- Examples: `build/w2c2/guest.c:15754`, `build/w2c2/guest.c:47187`
+
+`TF` verifies the table index and nullness, then casts the stored generic function pointer to the signature requested by the call site:
+
+```c
+#define TF(table, index, t) ((t)wasm_table_get(&(table), (index)))
+```
+
+Wasm requires `call_indirect` to trap when the selected function’s type does not match the instruction’s expected type. Here, an attacker can call a legitimate generated function through an incompatible C function-pointer type.
+
+Calling through an incompatible function type is undefined behavior in C. On the current x86-64/tcc combination it will often only scramble arguments or return values, but that is not a defensible security property and may become exploitable as generated shapes or compiler behavior change.
+
+Suggested fix:
+
+- Store `{ function_pointer, type_id }` in each table slot.
+- Have the generator assign a canonical type ID to every Wasm function signature.
+- Pass the expected type ID into `wasm_table_get` and trap on mismatch before casting/calling.
+- Avoid using a bare `void (*)(void)` as the complete table representation.
+
+### Medium: table maximum is not checked against the arena
+
+Location: `rt/w2c2_base.h:172-175`
+
+`wasmTableAllocate` checks `size > wasm_table_arena_size`, but accepts an arbitrarily larger `maxSize`:
+
+```c
+if (t->data || size > wasm_table_arena_size)
+    trap(...);
+t->maxSize = maxSize;
+```
+
+There is currently no table-growth helper, so this is not directly exploitable by the supplied generated files. It becomes an overflow risk as soon as `table.grow` is supported, and leaves the runtime object claiming capacity that cannot exist.
+
+Suggested fix:
+
+```c
+if (t->data ||
+    size > maxSize ||
+    maxSize > wasm_table_arena_size)
+    trap(trapAllocationFailed);
+```
+
+### Medium: 4 GiB linear memory wraps `wasmMemory.size` to zero
+
+Locations:
+
+- `rt/w2c2_base.h:103`
+- `rt/w2c2_base.h:109-124`
+
+`size` is `U32`, and is calculated as:
+
+```c
+m->size = pages * 65536;
+```
+
+At the Wasm32 architectural limit of 65,536 pages, the byte size is exactly 2³² and becomes zero in `U32`. All accesses then trap incorrectly.
+
+The configured builds use at most 4,096 pages, so this does not affect the current artifacts. It is nevertheless a latent correctness issue if `ARENA_PAGES` is raised.
+
+Suggested fix:
+
+- Store the current byte length as `U64` or host `size_t`.
+- Widen before multiplication:
+
+```c
+m->size = (U64)pages * WASM_PAGE_SIZE;
+```
+
+- Apply the same rule when validating arena configuration.
+
+### Medium: Wasm effective-address overflow has incorrect semantics
+
+Generated access examples culminate in checked helpers such as:
+
+- `build/w2c2/guest.c:54523-54525`
+- Emitter: `w2c2/c.c:1145-1170`, `w2c2/c.c:1295-1318`
+
+w2c2 computes a load/store effective address as `U32 base + constant_offset` before passing it to the checked accessor. That addition can wrap to a small in-bounds address.
+
+This does not escape the arena, because the wrapped address is still checked, but it violates Wasm semantics: the operation should trap when the mathematical effective address exceeds the current memory.
+
+Suggested fix:
+
+- Pass base and static offset separately to the accessor, or compute in `U64`.
+- Trap if the full widened `base + offset + access_size` exceeds memory size.
+
+## Host and seccomp audit
+
+### No unintended post-seccomp syscalls found
+
+Relevant locations:
+
+- Seccomp entry: `host/main.c:63-68`
+- Guest execution: `host/main.c:68-70`
+- Raw syscall wrapper: `host/main.c:19-23`
+- Exit path: `host/main.c:24-25`
+
+After successful `PR_SET_SECCOMP`, the host performs:
+
+1. `guestInstantiate`
+2. `guest__start`
+3. raw `SYS_exit`
+
+The release artifacts inspected were static ELF executables with no dynamic section or unresolved symbols. Disassembly of both:
+
+- `build/rot13/sandbox`
+- `build/w2c2/sandbox`
+
+showed exactly one `syscall` instruction, inside the shared `sys3` wrapper. There were no `int 0x80` or `sysenter` sites.
+
+Thus, tcc has not inserted startup, TLS, allocator, stack-protector, or arithmetic-helper syscalls into these binaries. `memcpy`, `memmove`, and `memset` are host-provided loops. Generated `NewChild` can reach `calloc`, but the host implementation traps rather than allocating.
+
+The `DEMO_ESCAPE` configuration at `host/main.c:52-54` deliberately requests `getpid`; it must remain excluded from production builds. Strict seccomp kills it as expected.
+
+Even if memory corruption obtains arbitrary native control flow, strict seccomp should continue to reject other syscalls. The memory-safety findings still permit disclosure/corruption of process memory and invalidate the intended C-level sandbox boundary.
+
+## Guest libc correctness and determinism
+
+### High: allocation-size multiplication overflows in `calloc`
+
+Location: `libc/libc.c:28-31`
+
+```c
+void* p = malloc(n * m);
+if (p) memset(p, 0, n * m);
+```
+
+The multiplication is unchecked. A wrapped product allocates and clears a smaller block than the caller requested. w2c2 uses `calloc(count, element_size)` for attacker-controlled module counts, so a crafted input can turn this into guest-memory corruption during translation.
+
+Although guest-memory corruption remains inside the outer arena once the runtime issues are fixed, it can make the generated output incorrect or non-reproducible.
+
+Suggested fix:
+
+```c
+if (m && n > SIZE_MAX / m)
+    return NULL;
+size_t total = n * m;
+```
+
+### High: `fopen` and buffered writes discard failed `realloc` results
+
+Locations:
+
+- `libc/stdio.c:18-35`
+- `libc/stdio.c:39-46`
+
+Examples:
+
+```c
+f->cap *= 2;
+f->buf = realloc(f->buf, f->cap);
+```
+
+On failure, the old pointer is lost and execution continues with `NULL`. Capacity doubling and `f->len + total` can also wrap. Similar unchecked allocations occur for `f->name` and the initial buffers.
+
+For a sufficiently large or adversarial Wasm input/output, native w2c2 returns an allocation error or write failure, while guest w2c2 can trap, corrupt its heap, or emit truncated/different C.
+
+Suggested fix:
+
+- Check every allocation.
+- Store `realloc` into a temporary.
+- Check capacity addition and doubling for overflow.
+- Preserve the original object on failure and propagate an error.
+
+### Medium: `realloc` does not implement standard zero-size behavior
+
+Location: `libc/libc.c:33-41`
+
+For `realloc(p, 0)`, the code returns `p` because `0 <= old`. C permits implementation variation around zero-size allocation, so this alone is not necessarily invalid, but it can differ from the native libc and complicate cross-platform behavior.
+
+More importantly, `realloc` trusts the 16-byte-preceding size header without validating that `p` is an allocator result. That is acceptable only if this libc is explicitly treated as unsafe guest code, not as a general memory-safety boundary.
+
+Suggested fix:
+
+- Define and document one intentional zero-size policy.
+- Consider allocating zero as a minimum-sized object or returning `NULL`.
+- If malformed guest pointers must be diagnosed, track heap bounds and validate alignment/header range.
+
+### Medium: `fread(..., size = 0, ...)` divides by zero
+
+Location: `libc/stdio.c:48-55`
+
+The return statement is:
+
+```c
+return total / sz;
+```
+
+When `sz == 0`, standard `fread` must return zero, but this implementation divides by zero.
+
+Suggested fix:
+
+```c
+if (sz == 0 || n == 0)
+    return 0;
+```
+
+Also check multiplication overflow in `sz * n`.
+
+### Medium: `fseek` accepts invalid and out-of-range positions
+
+Locations:
+
+- `libc/stdio.c:56-61`
+- Consequence: `libc/stdio.c:51`
+
+`fseek` always succeeds and computes:
+
+```c
+f->pos = base + (size_t)off;
+```
+
+Negative offsets can wrap, invalid `whence` is treated as `SEEK_END`, and positions beyond the buffer are accepted. A later `fread` evaluates `f->len - f->pos`, which can underflow and produce an oversized copy.
+
+The current w2c2 `readFile` path uses only the valid sequence `SEEK_END`, `ftell`, `rewind`, but this FILE layer is not generally correct.
+
+Suggested fix:
+
+- Reject invalid `whence`.
+- Compute signed offsets without unsigned conversion.
+- Reject negative resulting positions.
+- In `fread`, first handle `pos >= len`.
+- Decide explicitly whether seeking past end is supported for output streams.
+
+### Low: negative zero-padding in `printf` is incorrect
+
+Locations: `libc/stdio.c:100-117`
+
+The sign is placed inside `body`, while padding is emitted before the body. Thus:
+
+```c
+sprintf(buf, "%05d", -12)
+```
+
+produces `00-12` instead of `-0012`.
+
+Numeric precision is also parsed but ignored, and the `0` flag is not disabled by `-` or numeric precision as required by standard `printf`.
+
+This does not appear to affect current w2c2 code generation: its zero-padded formats are unsigned hexadecimal (`%02X`, `%08X`, `%016llX`). It can affect diagnostics or future generator changes.
+
+Suggested fix:
+
+- Emit the sign before zero padding.
+- Implement numeric precision separately from field width.
+- Make `-` override `0`.
+
+### Low: `qsort` is deterministic for current uses, but artificially limited
+
+Location: `libc/stdio.c:159-167`
+
+The stable insertion sort is deterministic, and the important function-hash comparator now has an explicit index tie-break at `w2c2/main.c:107-119`. I found no present output nondeterminism caused by sorting.
+
+However, `qsort` aborts for element sizes above 64 bytes:
+
+```c
+char tmp[64];
+if (size > sizeof tmp) abort();
+```
+
+That is not a conforming general `qsort`. It also lacks overflow checks for `i * size`.
+
+Suggested fix:
+
+- Allocate the temporary element dynamically, or perform byte-wise rotation without a fixed limit.
+- Guard index multiplication.
+- Keep total-order comparator tie-breakers; do not depend on sort stability for reproducible output.
+
+## TCB reduction opportunities
+
+- The generated guest C is large but is not conceptually a trusted library; the trusted property should instead be established by a small, complete set of checked runtime primitives. Direct element writes and unchecked data-segment pointers currently break that abstraction.
+- `w2c2/debug.c` and DWARF machinery are compiled but inactive without libdwarf.
+- Thread, WASI, multi-module, cleanup/glob, and platform compatibility paths are unnecessary for the fixed wasm32-to-C build.
+- tcc’s in-memory execution, archive/tooling, assembler, and other unused front-end paths can be removed from a purpose-built translator compiler.
+- Generated `NewChild`, export metadata, resolver callbacks, free-instance code, and host `calloc` are unnecessary if the sandbox only instantiates one fixed module with three statically linked imports. Removing their generation would reduce both code size and callable surface.
+- The FILE abstraction contains substantially more behavior than the translator needs. A fixed stdin-backed input object and framed stdout output object would be smaller and easier to make overflow-safe.
+
+## Recommended remediation order
+
+1. Fix checked data-segment source ranges for `memory.init`.
+2. Replace direct element-segment table writes with checked initialization.
+3. Add `call_indirect` type IDs and signature validation.
+4. Add adversarial regression modules for all three cases.
+5. Fix guest-libc allocation and FILE arithmetic.
+6. Correct 4 GiB memory accounting and effective-address semantics.
+7. Trim unused w2c2/tcc/runtime features only after the safety boundary is complete.
+CODEX_EXIT 0
