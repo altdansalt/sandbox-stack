@@ -25,6 +25,7 @@ typedef enum bool { false = 0, true = 1 } bool;
 #define NULL ((void*)0)
 
 #define W2C2_INLINE __inline__
+#define W2C2_LL(x) x ## ll
 #define W2C2_LOOP_START
 #define NORETURN __attribute__((noreturn))
 #define UNUSED __attribute__((unused))

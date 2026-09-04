@@ -149,28 +149,6 @@ stringBuilderAppendI64(
 }
 
 bool
-stringBuilderAppendF32(
-    StringBuilder* stringBuilder,
-    const F32 value
-) {
-    char buffer[32];
-    /* FLT_DECIMAL_DIG */
-    const int length = sprintf(buffer, "%.9g", value);
-    return stringBuilderAppendSized(stringBuilder, buffer, (size_t) length);
-}
-
-bool
-stringBuilderAppendF64(
-    StringBuilder* stringBuilder,
-    const F64 value
-) {
-    char buffer[32];
-    /* DBL_DECIMAL_DIG */
-    const int length = sprintf(buffer, "%.17g", value);
-    return stringBuilderAppendSized(stringBuilder, buffer, (size_t) length);
-}
-
-bool
 stringBuilderAppendCharHex(
     StringBuilder* stringBuilder,
     const char value

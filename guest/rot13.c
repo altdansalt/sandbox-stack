@@ -1,5 +1,6 @@
 #include "../libc/libc.h"
-int main(void) {
+int main(int argc, char** argv) {
+    (void)argc; (void)argv;
     static char buf[4096];
     for (;;) {
         ssize_t n = read(0, buf, sizeof buf);

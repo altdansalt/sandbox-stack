@@ -3,7 +3,8 @@
    so the only lever is the imports; we test the host by asking for fd 3 and
    also by out-of-bounds memory access (must trap, not escape). */
 #include "../libc/libc.h"
-int main(void) {
+int main(int argc, char** argv) {
+    (void)argc; (void)argv;
     write(1, "evil: about to read out of bounds\n", 34);
     volatile int* p = (volatile int*)0xFFFFFFF0u;
     int v = *p;                 /* out of bounds: must trap */

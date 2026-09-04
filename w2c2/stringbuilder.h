@@ -98,20 +98,6 @@ stringBuilderAppendI64(
 
 bool
 WARN_UNUSED_RESULT
-stringBuilderAppendF32(
-    StringBuilder* stringBuilder,
-    F32 value
-);
-
-bool
-WARN_UNUSED_RESULT
-stringBuilderAppendF64(
-    StringBuilder* stringBuilder,
-    F64 value
-);
-
-bool
-WARN_UNUSED_RESULT
 stringBuilderAppendU32Hex(
     StringBuilder* stringBuilder,
     U32 value

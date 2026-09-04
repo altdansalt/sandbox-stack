@@ -1066,10 +1066,11 @@ wasmCWriteLiteral(
                     MUST (stringBuilderAppendU32Hex(builder, bits))
                     MUST (stringBuilderAppendChar(builder, ')'))
                 }
-            } else if (bits == 0x80000000U) {
-                MUST (stringBuilderAppend(builder, "-0.f"))
             } else {
-                MUST (stringBuilderAppendF32(builder, value.f32))
+                /* patched: always emit the exact bit pattern (no %.9g, no float printf in the libc) */
+                MUST (stringBuilderAppend(builder, "f32_reinterpret_i32(0x"))
+                MUST (stringBuilderAppendU32Hex(builder, bits))
+                MUST (stringBuilderAppendChar(builder, ')'))
             }
             break;
         }
@@ -1088,10 +1089,11 @@ wasmCWriteLiteral(
                     MUST (stringBuilderAppendU64Hex(builder, bits))
                     MUST (stringBuilderAppendChar(builder, ')'))
                 }
-            } else if (bits == W2C2_LL(0x8000000000000000U)) {
-                MUST (stringBuilderAppend(builder, "-0.f"))
             } else {
-                MUST (stringBuilderAppendF64(builder, value.f64))
+                /* patched: always emit the exact bit pattern (no %.17g, no float printf in the libc) */
+                MUST (stringBuilderAppend(builder, "f64_reinterpret_i64(0x"))
+                MUST (stringBuilderAppendU64Hex(builder, bits))
+                MUST (stringBuilderAppendChar(builder, ')'))
             }
             break;
         }

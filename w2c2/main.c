@@ -110,7 +110,13 @@ wasmFunctionIDsCompareHashes(
 ) {
     const WasmFunctionID* functionIDA = a;
     const WasmFunctionID* functionIDB = b;
-    return memcmp(functionIDA->hash, functionIDB->hash, SHA1_DIGEST_LENGTH);
+    const int c = memcmp(functionIDA->hash, functionIDB->hash, SHA1_DIGEST_LENGTH);
+    /* patched: total order (tie-break on index) so output does not depend on qsort stability */
+    if (c != 0) {
+        return c;
+    }
+    return functionIDA->functionIndex < functionIDB->functionIndex ? -1
+         : functionIDA->functionIndex > functionIDB->functionIndex ? 1 : 0;
 }
 
 WasmFunctionIDs
@@ -225,7 +231,10 @@ cleanImplementationFiles(void) {
     do {
         path = findFileData.cFileName;
 #else
-#error "Unable to find files"
+    /* patched: no directory listing available (wasm guest); nothing to clean */
+    (void)path; (void)pathCharIndex; (void)allDigits; (void)pathLength;
+    return;
+    while (0) {
 #endif
         pathCharIndex = 0;
         allDigits = true;
@@ -490,10 +499,9 @@ main(
 
             fprintf(
                 stderr,
-                "w2c2: %lu of %lu functions are dynamic (%.2f%%)\n",
+                "w2c2: %lu of %lu functions are dynamic\n",
                 dynamicFunctionIDs.length,
-                total,
-                (float)dynamicFunctionIDs.length / (float)total * 100.0
+                total
             );
         } else {
             staticFunctionIDs = functionIDs;

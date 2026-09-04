@@ -1,7 +1,8 @@
 /* memory.grow probe: grow within max must succeed, beyond max must fail (-1), never realloc. */
 #include "../libc/libc.h"
 static void put(const char* s) { write(1, s, strlen(s)); }
-int main(void) {
+int main(int argc, char** argv) {
+    (void)argc; (void)argv;
     unsigned long pages = __builtin_wasm_memory_size(0);
     put(pages == 16 ? "initial pages: 16\n" : "initial pages: unexpected\n");
     put(__builtin_wasm_memory_grow(0, 100) == 16 ? "grow 100: ok (old=16)\n" : "grow 100: FAIL\n");
