@@ -1,5 +1,8 @@
 #ifndef _UNISTD_H
 #define _UNISTD_H
+#ifdef __chibicc__
+#define __attribute__(x)
+#endif
 #include <stddef.h>
 typedef long ssize_t;
 ssize_t read(int fd, void* buf, size_t n);

@@ -1,4 +1,4 @@
-#include "../libc/libc.h"
+#include "libc.h"
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
     static char buf[4096];

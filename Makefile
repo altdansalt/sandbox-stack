@@ -1,5 +1,5 @@
 # Pipeline: guest/X.c --clang(untrusted)--> build/X.wasm --w2c2--> build/X/guest.c --tcc--> build/X/sandbox
-WCC = clang --target=wasm32 -O2 -nostdlib -ffreestanding -fno-builtin -Wall -Wno-empty-body
+WCC = clang --target=wasm32 -O2 -nostdlib -ffreestanding -fno-builtin -Wall -Wno-empty-body -Ilibc
 WLD = -Wl,--no-entry -Wl,--export=_start -Wl,--export=memory -Wl,--allow-undefined \
       -Wl,--initial-memory=1048576 -Wl,--max-memory=16777216 -Wl,-z,stack-size=65536
 GUESTS = cat rot13 evil grow escape
@@ -54,3 +54,35 @@ build/w2c2/sandbox: build/w2c2.wasm host/main.c rt/w2c2_base.h build/w2c2-native
 	./build/w2c2-native build/w2c2/guest.wasm build/w2c2/guest.c
 	$(TCC) -nostdlib -static -nostdinc -Irt -Ibuild/w2c2 -DARENA_PAGES=4096 -o $@ host/main.c build/w2c2/guest.c
 include tests/tests.mk
+
+# ---- Experiment 3: C -> wasm with the chibicc backend (no clang) ----
+CC_SRCS = $(wildcard cc/*.c cc/*.h)
+build/chibicc-wasm: $(CC_SRCS)
+	@mkdir -p build
+	clang -O2 -Wno-unused-function -Wno-unused-variable -Wno-switch -o $@ $(filter %.c,$(CC_SRCS))
+
+# single translation unit per guest: the guest source plus the libc
+build/cc/%.c: guest/%.c libc/libc.c
+	@mkdir -p build/cc
+	printf '#include "guest/$*.c"\n#include "libc/libc.c"\n' > $@
+
+build/cc/%.wasm: build/cc/%.c build/chibicc-wasm libc/libc.h
+	./build/chibicc-wasm -I. -Ilibc -Ilibc/include -mmaxpages=256 -o $@ $<
+
+build/cc/%/guest.c: build/cc/%.wasm build/w2c2-native
+	@mkdir -p build/cc/$*
+	cp $< build/cc/$*/guest.wasm
+	./build/w2c2-native build/cc/$*/guest.wasm $@
+
+build/cc/%/sandbox: build/cc/%/guest.c host/main.c rt/w2c2_base.h
+	$(TCC) -nostdlib -static -nostdinc -Irt -Ibuild/cc/$* -DARENA_PAGES=$(ARENA_PAGES) -o $@ host/main.c $<
+
+build/cc/w2c2.c: $(W2C2_SRC) libc/libc.c libc/stdio.c
+	@mkdir -p build/cc
+	(printf '#include "libc/libc.c"\n#include "libc/stdio.c"\n'; for f in $(W2C2_SRC); do printf '#include "%s"\n' $$f; done) > $@
+
+build/cc/w2c2.wasm: build/cc/w2c2.c build/chibicc-wasm $(wildcard w2c2/*.h) $(wildcard libc/include/*.h)
+	./build/chibicc-wasm -I. -Ilibc -Ilibc/include -Iw2c2 -DHAS_UNISTD=1 -DGUEST_ARGV='"w2c2","guest.wasm","guest.c"' -mstack=4194304 -mmaxpages=4096 -o $@ $<
+
+exp3-guests: $(GUESTS:%=build/cc/%/sandbox)
+.PHONY: exp3-guests

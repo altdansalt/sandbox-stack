@@ -140,3 +140,67 @@ Regenerated from scratch (`rm -rf build/cmp build/w2c2 build/gen2 ...`): sandbox
 | **total** | | **39757** | **422730** |
 
 Delta vs Experiment 2 (421,143 tokens): +1587 tokens for the three memory-safety fixes plus the libc hardening (+935 w2c2 core, +366 runtime header, +275 libc, +11 host). The safety of arbitrary wasm now rests on the runtime accessors, not on trusting the generated C.
+
+## Experiment 3: C → wasm without clang (done, verified)
+
+### What was built
+`cc/`: a chibicc derivative (upstream commit in `cc/UPSTREAM`) whose x86-64 `codegen.c` is replaced by a wasm32 backend that emits the binary directly (no wat, no assembler, no linker, no WABT). Single translation unit; the guest and the libc are `#include`d into one file (`build/cc/<name>.c`).
+
+Backend design (all in `cc/codegen.c`, 1,016 lines):
+- Every C local lives on a shadow stack in linear memory (`$sp` global, `$fp` local), so `&local` works; expressions evaluate on the wasm operand stack. Value classes: ≤4-byte ints and pointers → i32, 8-byte ints → i64, float → f32, double/long double → f64. Struct-typed expressions evaluate to the struct's address, as in chibicc.
+- ILP32 (`long` and pointers 4 bytes, `long long` 8), matching clang's wasm32, so the same libc headers work. This needed a distinct `ty_llong`/`ty_ullong` in `type.c`, the `long long` cases in `declspec`, and a rewrite of integer-literal typing in `tokenize.c` (which now tracks the `LL` suffix).
+- ABI: struct params passed by pointer and copied by the callee; every struct return gets a hidden first pointer parameter (chibicc only did this above 16 bytes; one-line change in `parse.c`); variadic functions take one trailing i32 pointing at 8-byte argument slots that the caller pushes on the shadow stack; `va_list` is a `char*` (`libc/include/stdarg.h` has the `__chibicc__` variant). Function pointers are table indices (index+1; 0 is null); every function is in the table.
+- Control flow: `if`/`for`/`while`/`do` map to `block`/`loop`/`br`; `switch` uses the nested-block trick (one block per case, cases end their own block), so **fallthrough works for free**. `goto` is supported only forward to a label at the top level of the function body (a block per label opened at function entry); every `goto` in w2c2 is a forward `goto fail;`, so nothing had to be patched. `return` is a `br` to an outer block with the value in a local, so the epilogue restores `$sp` once.
+- Imports: an undefined function named `__env_X` is imported as `env.X`; any other undefined function is an error. Exports: `_start` by name, and `memory`.
+- Unsupported on purpose: `alloca`, VLAs, bitfields, TLS, atomics, `asm`, statement expressions, labels-as-values, backward or nested `goto`, structs as variadic args. Each is a clear error, not silent miscompilation.
+- Predefined macros changed to `__wasm32__`/`__ILP32__`/little-endian; the x86-64/Linux ones are gone.
+- Driver `cc/main.c` is 80 lines: `-I`, `-D`, `-E`, `-o`, `-mstack=`, `-mmaxpages=`. No subprocesses.
+
+### Results
+| check | result |
+|---|---|
+| cat, rot13, evil, grow, escape compiled by chibicc-wasm, then w2c2 → tcc → seccomp | all behave exactly as the clang builds (rot13 output, OOB trap 6, grow refusals, fd-3 refusal) |
+| w2c2 + libc as one TU (11,977 lines) compiled by chibicc-wasm | compiles; 225,143-byte wasm (clang -O2: 127,207) |
+| that w2c2.wasm in the sandbox translating rot13.wasm | byte-identical to native w2c2 and to wazero |
+| that w2c2.wasm in the sandbox translating **itself** | byte-identical to native w2c2 and to wazero (1,358,188 bytes of C) |
+| gen-2 (tcc-compile the C the sandboxed translator emitted for itself) | binary identical to gen-1 |
+| chibicc-wasm compiled by **tcc** instead of clang | emits a byte-identical w2c2.wasm |
+| `make test` (probes + adversarial modules) | all pass |
+
+So the clang leg is gone: C source → chibicc-wasm → w2c2 → tcc → seccomp-strict, and every tool in that chain can itself be compiled by tcc. Cost: the unoptimised code is ~16× slower (sandboxed self-translation 3.4 s vs 0.21 s) and 2× larger; irrelevant for the experiment.
+
+### Sharp edges found
+- chibicc keeps every declaration of a global as its own object and binds names to the latest one, so after a header is included twice, references point at an `extern` declaration rather than the definition. The backend resolves globals by name (`global_def` map) and lays out one storage location per name.
+- chibicc's `equal()` reads `tok->len` bytes of a shorter string literal (harmless on glibc, flagged by ASan); made bounds-safe.
+- `ND_MEMZERO`/`ND_NULL_EXPR` nodes have no type; the value-class lookup treats a missing type as "no value".
+- My own printf used `goto` into a label inside a `switch`; rewritten without `goto` (the backend's forward-goto rule is real).
+- The grow probe assumed clang's 16 initial pages; rewritten to read the initial size. chibicc-wasm places a 1 MiB stack after the data, so its modules start with more pages.
+- w2c2's sources include `w2c2_base.h` (for its own type names), whose endianness detection needs `__LITTLE_ENDIAN__`; added to the predefined macros.
+
+### Measurement (Experiment 3)
+| component | files | code lines | comment lines | tokens (o200k_base) | bytes |
+|---|---:|---:|---:|---:|---:|
+| w2c2 core (vendored, patched; excludes tests and upstream w2c2_base.h) | 45 | 12090 | 353 | 97775 | 407730 |
+| w2c2 runtime header (rt/w2c2_base.h, rewritten) | 1 | 179 | 18 | 3275 | 9622 |
+| tcc (x86_64 Linux build inputs, commit 62c30a4a) | 20 | 27008 | 3126 | 315053 | 1055247 |
+| minimal libc (libc/) | 16 | 449 | 17 | 5908 | 18188 |
+| host (host/main.c) | 1 | 60 | 4 | 990 | 2759 |
+| chibicc-wasm (cc/, replaces clang) | 10 | 5935 | 677 | 66927 | 212587 |
+| **total** | | **45721** | | **489928** | |
+
+Tokens changed versus upstream chibicc (line-level diff, o200k_base tokens of removed and added lines):
+
+| chibicc file | upstream tokens | ours | tokens removed | tokens added |
+|---|---:|---:|---:|---:|
+| chibicc.h | 2820 | 2847 | 0 | 27 |
+| codegen.c | 14777 | 12608 | 14618 | 12364 |
+| main.c | 5484 | 807 | 5461 | 655 |
+| parse.c | 26607 | 26616 | 79 | 88 |
+| preprocess.c | 9629 | 9598 | 158 | 127 |
+| tokenize.c | 6113 | 6245 | 149 | 281 |
+| type.c | 2454 | 2493 | 90 | 129 |
+| **total changed** | | | **20555** | **13671** |
+
+Reading: the backend is a full replacement of `codegen.c` (12.4k tokens written) and a rewrite of the driver (0.7k); the front end changed by ~600 tokens across `parse.c`, `type.c`, `tokenize.c`, `preprocess.c`, `chibicc.h`. Unchanged: `hashmap.c`, `strings.c`, `unicode.c`.
+
+The full TCB with clang replaced is 489,928 tokens; tcc is 64% of it. Note that the TCB now contains *two* C compilers (chibicc-wasm at 67k tokens, tcc at 315k), which is the obvious next target: either teach chibicc-wasm's front end an x86-64 backend for the host side (chibicc upstream already has one; then tcc goes away, ~315k → ~15k), or run w2c2's output through chibicc-wasm again and interpret it. Not started, per the brief.

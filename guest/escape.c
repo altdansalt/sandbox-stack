@@ -1,6 +1,6 @@
 /* Asks the host for fd 3. A correct host refuses (returns -1). With the host
    built -DDEMO_ESCAPE, fd 3 makes the host issue getpid(2): the kernel must SIGKILL. */
-#include "../libc/libc.h"
+#include "libc.h"
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
     write(1, "escape: asking host for fd 3\n", 29);

@@ -98,7 +98,7 @@ static int format(Sink* k, const char* fmt, va_list ap) {
     int count = 0;
     while (*fmt) {
         const char* start = fmt;
-        char num[24]; int zero = 0, left = 0, width = 0, prec = -1, longs = 0, neg = 0, len;
+        char num[24]; int zero = 0, left = 0, width = 0, prec = -1, longs = 0, neg = 0, len, base;
         const char *digits, *body; unsigned long long v;
         if (*fmt != '%') { while (*fmt && *fmt != '%') fmt++; put(k, start, (size_t)(fmt - start)); count += (int)(fmt - start); continue; }
         fmt++;
@@ -106,7 +106,7 @@ static int format(Sink* k, const char* fmt, va_list ap) {
         while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
         if (*fmt == '.') { fmt++; prec = 0; while (*fmt >= '0' && *fmt <= '9') prec = prec * 10 + (*fmt++ - '0'); }
         while (*fmt == 'l' || *fmt == 'z') { longs++; fmt++; }
-        digits = "0123456789abcdef";
+        digits = "0123456789abcdef"; base = 0;
         switch (*fmt++) {
         case 's': body = va_arg(ap, const char*); if (!body) body = "(null)"; len = (int)strlen(body); if (prec >= 0 && len > prec) len = prec; break;
         case 'c': num[0] = (char)va_arg(ap, int); body = num; len = 1; break;
@@ -114,17 +114,17 @@ static int format(Sink* k, const char* fmt, va_list ap) {
         case 'd': case 'i': {
             long long sv = longs >= 2 ? va_arg(ap, long long) : (long long)va_arg(ap, int);
             if (sv < 0) { neg = 1; v = (unsigned long long)(-(sv + 1)) + 1; } else v = (unsigned long long)sv;
-            goto number;
+            base = 10; break;
         }
-        case 'u': v = longs >= 2 ? va_arg(ap, unsigned long long) : (unsigned long long)va_arg(ap, unsigned); goto number;
+        case 'u': v = longs >= 2 ? va_arg(ap, unsigned long long) : (unsigned long long)va_arg(ap, unsigned); base = 10; break;
         case 'X': digits = "0123456789ABCDEF"; /* fallthrough */
-        case 'x': v = longs >= 2 ? va_arg(ap, unsigned long long) : (unsigned long long)va_arg(ap, unsigned);
-            len = 0; do { num[23 - len++] = digits[v & 15]; v >>= 4; } while (v); body = num + 24 - len; break;
-        number:
-            len = 0; do { num[23 - len++] = digits[v % 10]; v /= 10; } while (v);
-            if (neg) num[23 - len++] = '-';
-            body = num + 24 - len; break;
+        case 'x': v = longs >= 2 ? va_arg(ap, unsigned long long) : (unsigned long long)va_arg(ap, unsigned); base = 16; break;
         default: abort(); /* floats and anything else are unsupported on purpose */
+        }
+        if (base) {
+            len = 0; do { num[23 - len++] = digits[v % (unsigned)base]; v /= (unsigned)base; } while (v);
+            if (neg) num[23 - len++] = '-';
+            body = num + 24 - len;
         }
         if (neg && zero && !left) { put(k, "-", 1); body++; len--; width--; count++; }
         if (!left) while (width > len) { put(k, zero ? "0" : " ", 1); width--; count++; }

@@ -1,5 +1,8 @@
 #ifndef _STDLIB_H
 #define _STDLIB_H
+#ifdef __chibicc__
+#define __attribute__(x)
+#endif
 #include <stddef.h>
 void* malloc(size_t n);
 void* calloc(size_t n, size_t m);

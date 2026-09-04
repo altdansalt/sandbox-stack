@@ -13,12 +13,17 @@ def w2c2_files():
     return sorted(os.path.join(W2C2, f) for f in os.listdir(W2C2)
                   if (f.endswith('.c') or f.endswith('.h')) and not f.endswith('_test.c') and not f.endswith('_test.h')
                   and f != 'test.c' and f != 'w2c2_base.h')
+CC = os.path.join(ROOT, 'cc')
+CC_UP = os.path.join(HOME, 'src/chibicc')
+def cc_files():
+    return sorted(os.path.join(CC, f) for f in os.listdir(CC) if f.endswith('.c') or f.endswith('.h'))
 COMPONENTS = [
     ('w2c2 core (vendored, patched; excludes tests and upstream w2c2_base.h)', w2c2_files),
     ('w2c2 runtime header (rt/w2c2_base.h, rewritten)', lambda: [os.path.join(ROOT, 'rt/w2c2_base.h')]),
     ('tcc (x86_64 Linux build inputs, commit 62c30a4a)', lambda: [os.path.join(TCC, f) for f in TCC_X86_64_LINUX]),
     ('minimal libc (libc/)', lambda: sorted(os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(ROOT, 'libc')) for f in fs)),
     ('host (host/main.c)', lambda: [os.path.join(ROOT, 'host/main.c')]),
+    ('chibicc-wasm (cc/, Experiment 3; replaces clang)', cc_files),
 ]
 import tiktoken
 enc = tiktoken.get_encoding('o200k_base')
@@ -38,3 +43,26 @@ print('| component | files | code lines | comment lines | tokens (o200k_base) | 
 print('|---|---:|---:|---:|---:|---:|')
 for r in rows: print('| %s | %d | %d | %d | %d | %d |' % r)
 print('| **total** | | **%d** | | **%d** | |' % (tl, tt))
+
+
+# ---- Experiment 3: tokens changed versus upstream chibicc ----
+import difflib
+def toks(text): return len(enc.encode(text))
+print()
+print('| chibicc file | upstream tokens | ours | tokens removed | tokens added |')
+print('|---|---:|---:|---:|---:|')
+trem = tadd = 0
+for f in sorted(set(os.listdir(CC_UP)) | set(os.listdir(CC))):
+    if not (f.endswith('.c') or f.endswith('.h')): continue
+    a = open(os.path.join(CC_UP, f)).read().splitlines(True) if os.path.exists(os.path.join(CC_UP, f)) else []
+    b = open(os.path.join(CC, f)).read().splitlines(True) if os.path.exists(os.path.join(CC, f)) else []
+    if not a and not b: continue
+    rem = add = 0
+    for line in difflib.unified_diff(a, b, n=0):
+        if line.startswith('---') or line.startswith('+++') or line.startswith('@@'): continue
+        if line.startswith('-'): rem += toks(line[1:])
+        elif line.startswith('+'): add += toks(line[1:])
+    if rem or add or not a or not b:
+        print('| %s | %d | %d | %d | %d |' % (f, toks(''.join(a)), toks(''.join(b)), rem, add))
+    trem += rem; tadd += add
+print('| **total changed** | | | **%d** | **%d** |' % (trem, tadd))
