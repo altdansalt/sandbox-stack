@@ -23,6 +23,15 @@ static void define_arg(char *str) {
     define_macro(str, "1");
 }
 
+static int parse_num(char *s, long lo, long hi, char *opt) {
+  char *end;
+  errno = 0;
+  long v = strtol(s, &end, 10);
+  if (errno || *end || !*s || v < lo || v > hi)
+    error("%s: expected a number in [%ld, %ld], got \"%s\"", opt, lo, hi, s);
+  return (int)v;
+}
+
 static void usage(int status) {
   fprintf(stderr, "usage: cc [-E] [-I<dir>] [-D<macro>[=val]] [-mstack=<bytes>] [-mmaxpages=<n>] -o <out.wasm> <input.c>\n");
   exit(status);
@@ -37,8 +46,8 @@ static void parse_args(int argc, char **argv) {
     if (!strncmp(argv[i], "-I", 2)) { strarray_push(&include_paths, argv[i] + 2); continue; }
     if (!strcmp(argv[i], "-D")) { if (!argv[++i]) usage(1); define_arg(argv[i]); continue; }
     if (!strncmp(argv[i], "-D", 2)) { define_arg(argv[i] + 2); continue; }
-    if (!strncmp(argv[i], "-mstack=", 8)) { opt_stack_size = atoi(argv[i] + 8); continue; }
-    if (!strncmp(argv[i], "-mmaxpages=", 11)) { opt_max_pages = atoi(argv[i] + 11); continue; }
+    if (!strncmp(argv[i], "-mstack=", 8)) { opt_stack_size = parse_num(argv[i] + 8, 16, 1 << 30, "-mstack"); continue; }
+    if (!strncmp(argv[i], "-mmaxpages=", 11)) { opt_max_pages = parse_num(argv[i] + 11, 1, 65536, "-mmaxpages"); continue; }
     if (!strcmp(argv[i], "--help")) usage(0);
     if (argv[i][0] == '-' && argv[i][1]) error("unknown argument: %s", argv[i]);
     if (input_path) error("only one input file is supported");

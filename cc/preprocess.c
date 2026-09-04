@@ -1059,7 +1059,6 @@ static char *format_time(struct tm *tm) {
 
 void init_macros(void) {
   // Define predefined macros
-  define_macro("_LP64", "1");
   define_macro("__C99_MACRO_WITH_VA_ARGS", "1");
   define_macro("__ILP32__", "1");
   define_macro("__LITTLE_ENDIAN__", "1");
@@ -1093,8 +1092,6 @@ void init_macros(void) {
   define_macro("__signed__", "signed");
   define_macro("__typeof__", "typeof");
   define_macro("__volatile__", "volatile");
-  define_macro("linux", "1");
-  define_macro("unix", "1");
 
   add_builtin("__FILE__", file_macro);
   add_builtin("__LINE__", line_macro);

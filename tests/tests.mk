@@ -21,3 +21,9 @@ test: all build/w2c2-native $(ADV:%=build/adv/%/sandbox) \
       build/escape/sandbox build/escape/sandbox-demo
 	@echo "=== functional ==="; \
 	bash tests/run.sh
+
+# chibicc-wasm regression tests (Experiment 3)
+test: test-cc
+test-cc: build/chibicc-wasm build/control
+	./tests/cc/run.sh
+.PHONY: test-cc

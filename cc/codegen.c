@@ -145,8 +145,9 @@ static void op(int o) { buf_u8(&code, o); }
 static void op_u(int o, uint64_t v) { buf_u8(&code, o); buf_uleb(&code, v); }
 static void i32c(int64_t v) { buf_u8(&code, OP_I32_CONST); buf_sleb(&code, (int32_t)v); }
 static void i64c(int64_t v) { buf_u8(&code, OP_I64_CONST); buf_sleb(&code, v); }
-static void f32c(float f) { buf_u8(&code, OP_F32_CONST); buf_bytes(&code, &f, 4); }
-static void f64c(double d) { buf_u8(&code, OP_F64_CONST); buf_bytes(&code, &d, 8); }
+static void buf_le(Buf *b, uint64_t v, int n) { for (int i = 0; i < n; i++) buf_u8(b, (v >> (8 * i)) & 0xff); }
+static void f32c(float f) { uint32_t u; memcpy(&u, &f, 4); buf_u8(&code, OP_F32_CONST); buf_le(&code, u, 4); }
+static void f64c(double d) { uint64_t u; memcpy(&u, &d, 8); buf_u8(&code, OP_F64_CONST); buf_le(&code, u, 8); }
 static void memarg(int o, int align_log2) { buf_u8(&code, o); buf_uleb(&code, align_log2); buf_uleb(&code, 0); }
 static void memory_copy(void) { op(OP_PREFIX_FC); buf_uleb(&code, 10); buf_u8(&code, 0); buf_u8(&code, 0); }
 static void memory_fill(void) { op(OP_PREFIX_FC); buf_uleb(&code, 11); buf_u8(&code, 0); }
@@ -847,7 +848,7 @@ static void gen_function(Obj *fn, Buf *out) {
 
 // ---- data ----
 static void layout_globals(Obj *prog) {
-  int addr = data_base;
+  int64_t addr = data_base;
   // initialised globals first, then zero-initialised ones, so one data segment covers the former;
   // one storage location per name (a tentative definition repeated in several headers is one object)
   for (int pass = 0; pass < 2; pass++) {
@@ -860,15 +861,18 @@ static void layout_globals(Obj *prog) {
       }
       hashmap_put(&global_def, var->name, var);
       int align = var->align < 1 ? 1 : var->align;
-      addr = align_to(addr, align);
-      var->offset = addr;
+      addr = align_to((int)addr, align);
+      var->offset = (int)addr;
       addr += var->ty->size;
+      if (addr > 0x7fffffff) error("globals do not fit in 2 GiB");
     }
-    if (pass == 0) data_end = addr;
+    if (pass == 0) data_end = (int)addr;
   }
-  int bss_end = addr;
-  int stack_bottom = align_to(bss_end, 16);
-  stack_top = stack_bottom + opt_stack_size;
+  int64_t stack_bottom = align_to(addr, 16);
+  int64_t top = stack_bottom + align_to(opt_stack_size, 16);
+  if (top + 65535 > (int64_t)opt_max_pages * 65536 || top > 0x7fffffff)
+    error("data (%d bytes) plus stack (%d bytes) do not fit in %d pages", (int)addr, opt_stack_size, opt_max_pages);
+  stack_top = (int)top;
   heap_base = stack_top;
 }
 
@@ -885,7 +889,7 @@ static void emit_data(Obj *prog, Buf *sec) {
         if (!strcmp(o->name, *rel->label)) { target = o; break; }
       if (!target) error("relocation to unknown symbol %s", *rel->label);
       uint32_t v = (uint32_t)(global_addr(target, var->tok) + rel->addend);
-      memcpy(img + var->offset - data_base + rel->offset, &v, 4);
+      for (int k = 0; k < 4; k++) img[var->offset - data_base + rel->offset + k] = (v >> (8 * k)) & 0xff;
     }
   }
   buf_uleb(sec, 1);               // one segment

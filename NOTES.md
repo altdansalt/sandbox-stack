@@ -204,3 +204,22 @@ Tokens changed versus upstream chibicc (line-level diff, o200k_base tokens of re
 Reading: the backend is a full replacement of `codegen.c` (12.4k tokens written) and a rewrite of the driver (0.7k); the front end changed by ~600 tokens across `parse.c`, `type.c`, `tokenize.c`, `preprocess.c`, `chibicc.h`. Unchanged: `hashmap.c`, `strings.c`, `unicode.c`.
 
 The full TCB with clang replaced is 489,928 tokens; tcc is 64% of it. Note that the TCB now contains *two* C compilers (chibicc-wasm at 67k tokens, tcc at 315k), which is the obvious next target: either teach chibicc-wasm's front end an x86-64 backend for the host side (chibicc upstream already has one; then tcc goes away, ~315k → ~15k), or run w2c2's output through chibicc-wasm again and interpret it. Not started, per the brief.
+
+## Codex review 2 (chibicc wasm backend): findings and fixes
+
+Request: `reviews/request-2.md`; report: `reviews/codex-review-2.md`. Seven findings, all fixed; regression tests in `tests/cc/` (run by `make test`, compiled by chibicc-wasm and executed under wazero).
+
+| # | severity | finding | fix |
+|---|---|---|---|
+| 1 | high | static `long double` initialisers serialised as integers (`parse.c` only handled float/double) | `TY_LDOUBLE` treated like double; test `ldouble.c` |
+| 2 | high | `switch` case values truncated to `int` in the parser | `int64_t` temporaries and `Node.begin/end`; test `case64.c` |
+| 3 | high | `int f();` was modelled as variadic, so a later prototyped definition got a phantom varargs parameter (compiler crash or ABI mismatch) | empty parameter list now means "no parameters"; a call with arguments through such a declaration is rejected ("too many arguments"); `is_compatible` distinguishes `long` from `long long` by size; test `knr.c` (must be rejected) |
+| 4 | medium | `_LP64`, `linux`, `unix` still predefined | removed |
+| 5 | medium | out-of-range integer literals silently mistyped; `strtoul` overflow unchecked | `strtoull` with `ERANGE` check; unsuffixed decimal above `INT64_MAX` is an error |
+| 6 | medium | `_Atomic`/`_Thread_local`/bitfield declarations accepted silently when unreferenced | rejected at parse time |
+| 7 | low | `-mstack`/`-mmaxpages` unchecked; layout arithmetic in `int` | range-checked options; 64-bit layout arithmetic; data+stack must fit `-mmaxpages` |
+| — | note | float constants and relocations written with host byte order | now serialised explicitly little-endian in the backend; `parse.c` still writes initialised scalars through host pointers (little-endian IEEE host assumed; documented, not fixed) |
+
+Codex found no problems in the cast/narrow rules, signedness of div/rem/shift/compare, struct-return and struct-parameter ABI, varargs, switch fallthrough, loop/continue nesting, `$sp` restore on return, short-circuit blocks, section encoding, or hash-order determinism. `tests/cc/varargs.c` and `switchfall.c` pin those down anyway.
+
+After the fixes the Experiment 3 fixpoint was re-run from scratch (rot13 and self, sandbox and wazero, gen-2): unchanged, byte-identical. `make test`: all pass. TCB: 45,735 lines / 490,402 tokens; tokens changed vs upstream chibicc: 20,706 removed, 14,297 added.

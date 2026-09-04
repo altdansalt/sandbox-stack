@@ -1,0 +1,4470 @@
+OpenAI Codex v0.152.1
+--------
+workdir: /home/exedev/sandbox-stack
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: none
+reasoning summaries: none
+session id: 01a06d88-cf81-7d22-baad-2ac6ce51585f
+--------
+user
+Review request: a wasm32 backend for chibicc (directory cc/ in this repo).
+
+Context: NOTES.md, section "Experiment 3". cc/codegen.c is new (replaces chibicc's x86-64 codegen.c); cc/main.c is a rewritten driver; cc/parse.c, type.c, tokenize.c, preprocess.c, chibicc.h have small patches (diff against ~/src/chibicc to see them). libc/include/stdarg.h and libc/libc.h have __chibicc__ variants that define the ABI from the C side.
+
+It compiles w2c2 (11k lines of C89) plus a small libc into a wasm module that reproduces native w2c2's output byte for byte, so gross bugs are unlikely; I want a careful review for:
+1. Miscompilation risks that the w2c2 test input would not exercise: integer conversion and narrowing rules (cast(), narrow(), gen_expr_as), signed/unsigned division and shifts, comparison of mixed types, pointer arithmetic with 64-bit indices, float<->int conversions, bool semantics, char signedness, ILP32 literal typing in tokenize.c (all combinations of U/L/LL suffixes and hex/decimal), long double as double.
+2. ABI consistency: hidden struct-return pointer (parse.c change + codegen), struct parameters copied by callee, varargs slots (caller stores, callee's va_arg reads 8-byte slots; float promoted to double), call_indirect signatures matching definitions, K&R-style empty parameter lists.
+3. Control flow lowering: switch with fallthrough, case ranges, nested loops with break/continue inside switch, forward goto blocks, return inside nested blocks with the $sp restore, do/while continue semantics, unreachable code after br, if/else with result types (ND_COND, && and ||).
+4. Memory layout: data segment relocations (pointers to globals/functions/strings in static initializers), globals resolved by name, alignment, stack/heap placement, memory min/max pages, and anything that could make output depend on hash-map iteration order or other nondeterminism.
+5. Wasm binary encoding correctness (LEB128 signed/unsigned use, section ordering, type dedup, elem/table sizes).
+6. Anything that would silently accept unsupported C instead of erroring.
+
+Be concrete: file:line, a minimal C snippet that triggers the bug, and the fix. Do not modify files. Write a markdown report to stdout.
+
+codex
+I’ll inspect the backend and its upstream diffs, then trace each requested risk area. I’ll keep the review read-only and return a concrete markdown report with repro snippets and fixes.
+exec
+/bin/bash -lc "pwd && rg --files cc libc | sort | sed -n '1,240p' && git status --short && rg -n \"Experiment 3\" NOTES.md" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+/home/exedev/sandbox-stack
+cc/LICENSE
+cc/UPSTREAM
+cc/chibicc.h
+cc/codegen.c
+cc/hashmap.c
+cc/main.c
+cc/parse.c
+cc/preprocess.c
+cc/strings.c
+cc/tokenize.c
+cc/type.c
+cc/unicode.c
+libc/include/assert.h
+libc/include/ctype.h
+libc/include/errno.h
+libc/include/limits.h
+libc/include/math.h
+libc/include/stdarg.h
+libc/include/stdbool.h
+libc/include/stddef.h
+libc/include/stdint.h
+libc/include/stdio.h
+libc/include/stdlib.h
+libc/include/string.h
+libc/include/unistd.h
+libc/libc.c
+libc/libc.h
+libc/stdio.c
+?? reviews/codex-review-2.log
+?? reviews/request-2.md
+52:- tcc is 76% of the tokens. The next-largest lever after Experiment 3 is trimming tcc (drop tccrun/tcctools/asm).
+144:## Experiment 3: C → wasm without clang (done, verified)
+180:### Measurement (Experiment 3)
+
+exec
+/bin/bash -lc "wc -l cc/codegen.c cc/main.c cc/{parse,type,tokenize,preprocess}.c cc/chibicc.h; sed -n '130,210p' NOTES.md; diff -u /home/exedev/src/chibicc/parse.c cc/parse.c || true; diff -u /home/exedev/src/chibicc/type.c cc/type.c || true; diff -u /home/exedev/src/chibicc/tokenize.c cc/tokenize.c || true; diff -u /home/exedev/src/chibicc/preprocess.c cc/preprocess.c || true; diff -u /home/exedev/src/chibicc/chibicc.h cc/chibicc.h || true" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+   993 cc/codegen.c
+    78 cc/main.c
+  3372 cc/parse.c
+   309 cc/type.c
+   808 cc/tokenize.c
+  1204 cc/preprocess.c
+   461 cc/chibicc.h
+  7225 total
+- **realloc validating the block header**: the guest libc is inside the arena and is not itself a safety boundary (the runtime accessors are). A malformed guest pointer corrupts only guest memory, which stays inside the seccomp+arena box.
+
+### Measurement (after review 1)
+| component | files | code lines | tokens (o200k_base) |
+|---|---:|---:|---:|
+| w2c2 core (vendored, patched) | 45 | 12090 | 97775 |
+| w2c2 runtime header (rt/w2c2_base.h) | 1 | 179 | 3275 |
+| tcc (x86_64 Linux, 62c30a4a) | 20 | 27008 | 315053 |
+| minimal libc (libc/) | 16 | 420 | 5637 |
+| host (host/main.c) | 1 | 60 | 990 |
+| **total** | | **39757** | **422730** |
+
+Delta vs Experiment 2 (421,143 tokens): +1587 tokens for the three memory-safety fixes plus the libc hardening (+935 w2c2 core, +366 runtime header, +275 libc, +11 host). The safety of arbitrary wasm now rests on the runtime accessors, not on trusting the generated C.
+
+## Experiment 3: C → wasm without clang (done, verified)
+
+### What was built
+`cc/`: a chibicc derivative (upstream commit in `cc/UPSTREAM`) whose x86-64 `codegen.c` is replaced by a wasm32 backend that emits the binary directly (no wat, no assembler, no linker, no WABT). Single translation unit; the guest and the libc are `#include`d into one file (`build/cc/<name>.c`).
+
+Backend design (all in `cc/codegen.c`, 1,016 lines):
+- Every C local lives on a shadow stack in linear memory (`$sp` global, `$fp` local), so `&local` works; expressions evaluate on the wasm operand stack. Value classes: ≤4-byte ints and pointers → i32, 8-byte ints → i64, float → f32, double/long double → f64. Struct-typed expressions evaluate to the struct's address, as in chibicc.
+- ILP32 (`long` and pointers 4 bytes, `long long` 8), matching clang's wasm32, so the same libc headers work. This needed a distinct `ty_llong`/`ty_ullong` in `type.c`, the `long long` cases in `declspec`, and a rewrite of integer-literal typing in `tokenize.c` (which now tracks the `LL` suffix).
+- ABI: struct params passed by pointer and copied by the callee; every struct return gets a hidden first pointer parameter (chibicc only did this above 16 bytes; one-line change in `parse.c`); variadic functions take one trailing i32 pointing at 8-byte argument slots that the caller pushes on the shadow stack; `va_list` is a `char*` (`libc/include/stdarg.h` has the `__chibicc__` variant). Function pointers are table indices (index+1; 0 is null); every function is in the table.
+- Control flow: `if`/`for`/`while`/`do` map to `block`/`loop`/`br`; `switch` uses the nested-block trick (one block per case, cases end their own block), so **fallthrough works for free**. `goto` is supported only forward to a label at the top level of the function body (a block per label opened at function entry); every `goto` in w2c2 is a forward `goto fail;`, so nothing had to be patched. `return` is a `br` to an outer block with the value in a local, so the epilogue restores `$sp` once.
+- Imports: an undefined function named `__env_X` is imported as `env.X`; any other undefined function is an error. Exports: `_start` by name, and `memory`.
+- Unsupported on purpose: `alloca`, VLAs, bitfields, TLS, atomics, `asm`, statement expressions, labels-as-values, backward or nested `goto`, structs as variadic args. Each is a clear error, not silent miscompilation.
+- Predefined macros changed to `__wasm32__`/`__ILP32__`/little-endian; the x86-64/Linux ones are gone.
+- Driver `cc/main.c` is 80 lines: `-I`, `-D`, `-E`, `-o`, `-mstack=`, `-mmaxpages=`. No subprocesses.
+
+### Results
+| check | result |
+|---|---|
+| cat, rot13, evil, grow, escape compiled by chibicc-wasm, then w2c2 → tcc → seccomp | all behave exactly as the clang builds (rot13 output, OOB trap 6, grow refusals, fd-3 refusal) |
+| w2c2 + libc as one TU (11,977 lines) compiled by chibicc-wasm | compiles; 225,143-byte wasm (clang -O2: 127,207) |
+| that w2c2.wasm in the sandbox translating rot13.wasm | byte-identical to native w2c2 and to wazero |
+| that w2c2.wasm in the sandbox translating **itself** | byte-identical to native w2c2 and to wazero (1,358,188 bytes of C) |
+| gen-2 (tcc-compile the C the sandboxed translator emitted for itself) | binary identical to gen-1 |
+| chibicc-wasm compiled by **tcc** instead of clang | emits a byte-identical w2c2.wasm |
+| `make test` (probes + adversarial modules) | all pass |
+
+So the clang leg is gone: C source → chibicc-wasm → w2c2 → tcc → seccomp-strict, and every tool in that chain can itself be compiled by tcc. Cost: the unoptimised code is ~16× slower (sandboxed self-translation 3.4 s vs 0.21 s) and 2× larger; irrelevant for the experiment.
+
+### Sharp edges found
+- chibicc keeps every declaration of a global as its own object and binds names to the latest one, so after a header is included twice, references point at an `extern` declaration rather than the definition. The backend resolves globals by name (`global_def` map) and lays out one storage location per name.
+- chibicc's `equal()` reads `tok->len` bytes of a shorter string literal (harmless on glibc, flagged by ASan); made bounds-safe.
+- `ND_MEMZERO`/`ND_NULL_EXPR` nodes have no type; the value-class lookup treats a missing type as "no value".
+- My own printf used `goto` into a label inside a `switch`; rewritten without `goto` (the backend's forward-goto rule is real).
+- The grow probe assumed clang's 16 initial pages; rewritten to read the initial size. chibicc-wasm places a 1 MiB stack after the data, so its modules start with more pages.
+- w2c2's sources include `w2c2_base.h` (for its own type names), whose endianness detection needs `__LITTLE_ENDIAN__`; added to the predefined macros.
+
+### Measurement (Experiment 3)
+| component | files | code lines | comment lines | tokens (o200k_base) | bytes |
+|---|---:|---:|---:|---:|---:|
+| w2c2 core (vendored, patched; excludes tests and upstream w2c2_base.h) | 45 | 12090 | 353 | 97775 | 407730 |
+| w2c2 runtime header (rt/w2c2_base.h, rewritten) | 1 | 179 | 18 | 3275 | 9622 |
+| tcc (x86_64 Linux build inputs, commit 62c30a4a) | 20 | 27008 | 3126 | 315053 | 1055247 |
+| minimal libc (libc/) | 16 | 449 | 17 | 5908 | 18188 |
+| host (host/main.c) | 1 | 60 | 4 | 990 | 2759 |
+| chibicc-wasm (cc/, replaces clang) | 10 | 5935 | 677 | 66927 | 212587 |
+| **total** | | **45721** | | **489928** | |
+
+Tokens changed versus upstream chibicc (line-level diff, o200k_base tokens of removed and added lines):
+
+| chibicc file | upstream tokens | ours | tokens removed | tokens added |
+|---|---:|---:|---:|---:|
+| chibicc.h | 2820 | 2847 | 0 | 27 |
+| codegen.c | 14777 | 12608 | 14618 | 12364 |
+| main.c | 5484 | 807 | 5461 | 655 |
+| parse.c | 26607 | 26616 | 79 | 88 |
+| preprocess.c | 9629 | 9598 | 158 | 127 |
+| tokenize.c | 6113 | 6245 | 149 | 281 |
+| type.c | 2454 | 2493 | 90 | 129 |
+| **total changed** | | | **20555** | **13671** |
+
+Reading: the backend is a full replacement of `codegen.c` (12.4k tokens written) and a rewrite of the driver (0.7k); the front end changed by ~600 tokens across `parse.c`, `type.c`, `tokenize.c`, `preprocess.c`, `chibicc.h`. Unchanged: `hashmap.c`, `strings.c`, `unicode.c`.
+
+The full TCB with clang replaced is 489,928 tokens; tcc is 64% of it. Note that the TCB now contains *two* C compilers (chibicc-wasm at 67k tokens, tcc at 315k), which is the obvious next target: either teach chibicc-wasm's front end an x86-64 backend for the host side (chibicc upstream already has one; then tcc goes away, ~315k → ~15k), or run w2c2's output through chibicc-wasm again and interpret it. Not started, per the brief.
+--- /home/exedev/src/chibicc/parse.c	2026-09-04 17:10:36.846273790 +0000
++++ cc/parse.c	2026-09-04 17:37:31.247355061 +0000
+@@ -540,19 +540,23 @@
+       break;
+     case LONG:
+     case LONG + INT:
+-    case LONG + LONG:
+-    case LONG + LONG + INT:
+     case SIGNED + LONG:
+     case SIGNED + LONG + INT:
++      ty = ty_long;
++      break;
++    case LONG + LONG:
++    case LONG + LONG + INT:
+     case SIGNED + LONG + LONG:
+     case SIGNED + LONG + LONG + INT:
+-      ty = ty_long;
++      ty = ty_llong;
+       break;
+     case UNSIGNED + LONG:
+     case UNSIGNED + LONG + INT:
++      ty = ty_ulong;
++      break;
+     case UNSIGNED + LONG + LONG:
+     case UNSIGNED + LONG + LONG + INT:
+-      ty = ty_ulong;
++      ty = ty_ullong;
+       break;
+     case FLOAT:
+       ty = ty_float;
+@@ -3233,13 +3237,13 @@
+   // A buffer for a struct/union return value is passed
+   // as the hidden first parameter.
+   Type *rty = ty->return_ty;
+-  if ((rty->kind == TY_STRUCT || rty->kind == TY_UNION) && rty->size > 16)
++  if (rty->kind == TY_STRUCT || rty->kind == TY_UNION)
+     new_lvar("", pointer_to(rty));
+ 
+   fn->params = locals;
+ 
+   if (ty->is_variadic)
+-    fn->va_area = new_lvar("__va_area__", array_of(ty_char, 136));
++    fn->va_area = new_lvar("__va_area__", pointer_to(ty_char));
+   fn->alloca_bottom = new_lvar("__alloca_size__", pointer_to(ty_char));
+ 
+   tok = skip(tok, "{");
+--- /home/exedev/src/chibicc/type.c	2026-09-04 17:10:36.846273790 +0000
++++ cc/type.c	2026-09-04 17:37:31.247355061 +0000
+@@ -6,16 +6,18 @@
+ Type *ty_char = &(Type){TY_CHAR, 1, 1};
+ Type *ty_short = &(Type){TY_SHORT, 2, 2};
+ Type *ty_int = &(Type){TY_INT, 4, 4};
+-Type *ty_long = &(Type){TY_LONG, 8, 8};
++Type *ty_long = &(Type){TY_LONG, 4, 4};
++Type *ty_llong = &(Type){TY_LONG, 8, 8};
+ 
+ Type *ty_uchar = &(Type){TY_CHAR, 1, 1, true};
+ Type *ty_ushort = &(Type){TY_SHORT, 2, 2, true};
+ Type *ty_uint = &(Type){TY_INT, 4, 4, true};
+-Type *ty_ulong = &(Type){TY_LONG, 8, 8, true};
++Type *ty_ulong = &(Type){TY_LONG, 4, 4, true};
++Type *ty_ullong = &(Type){TY_LONG, 8, 8, true};
+ 
+ Type *ty_float = &(Type){TY_FLOAT, 4, 4};
+ Type *ty_double = &(Type){TY_DOUBLE, 8, 8};
+-Type *ty_ldouble = &(Type){TY_LDOUBLE, 16, 16};
++Type *ty_ldouble = &(Type){TY_LDOUBLE, 8, 8};
+ 
+ static Type *new_type(TypeKind kind, int size, int align) {
+   Type *ty = calloc(1, sizeof(Type));
+@@ -95,7 +97,7 @@
+ }
+ 
+ Type *pointer_to(Type *base) {
+-  Type *ty = new_type(TY_PTR, 8, 8);
++  Type *ty = new_type(TY_PTR, 4, 4);
+   ty->base = base;
+   ty->is_unsigned = true;
+   return ty;
+@@ -117,7 +119,7 @@
+ }
+ 
+ Type *vla_of(Type *base, Node *len) {
+-  Type *ty = new_type(TY_VLA, 8, 8);
++  Type *ty = new_type(TY_VLA, 4, 4);
+   ty->base = base;
+   ty->vla_len = len;
+   return ty;
+--- /home/exedev/src/chibicc/tokenize.c	2026-09-04 17:10:36.846273790 +0000
++++ cc/tokenize.c	2026-09-04 17:43:23.490441974 +0000
+@@ -77,7 +77,7 @@
+ 
+ // Consumes the current token if it matches `op`.
+ bool equal(Token *tok, char *op) {
+-  return memcmp(tok->loc, op, tok->len) == 0 && op[tok->len] == '\0';
++  return strlen(op) == tok->len && memcmp(tok->loc, op, tok->len) == 0;
+ }
+ 
+ // Ensure that the current token is `op`.
+@@ -359,19 +359,20 @@
+   // Read U, L or LL suffixes.
+   bool l = false;
+   bool u = false;
++  bool ll = false;
+ 
+   if (startswith(p, "LLU") || startswith(p, "LLu") ||
+       startswith(p, "llU") || startswith(p, "llu") ||
+       startswith(p, "ULL") || startswith(p, "Ull") ||
+       startswith(p, "uLL") || startswith(p, "ull")) {
+     p += 3;
+-    l = u = true;
++    l = u = ll = true;
+   } else if (!strncasecmp(p, "lu", 2) || !strncasecmp(p, "ul", 2)) {
+     p += 2;
+     l = u = true;
+   } else if (startswith(p, "LL") || startswith(p, "ll")) {
+     p += 2;
+-    l = true;
++    l = ll = true;
+   } else if (*p == 'L' || *p == 'l') {
+     p++;
+     l = true;
+@@ -383,28 +384,30 @@
+   if (p != tok->loc + tok->len)
+     return false;
+ 
+-  // Infer a type.
++  // Infer a type (ILP32: int and long are 4 bytes, long long is 8).
+   Type *ty;
+-  if (base == 10) {
++  if (ll) {
++    ty = u ? ty_ullong : (base != 10 && (val >> 63)) ? ty_ullong : ty_llong;
++  } else if (base == 10) {
+     if (l && u)
+-      ty = ty_ulong;
++      ty = (val >> 32) ? ty_ullong : ty_ulong;
+     else if (l)
+-      ty = ty_long;
++      ty = (val >> 31) ? ty_llong : ty_long;
+     else if (u)
+-      ty = (val >> 32) ? ty_ulong : ty_uint;
++      ty = (val >> 32) ? ty_ullong : ty_uint;
+     else
+-      ty = (val >> 31) ? ty_long : ty_int;
++      ty = (val >> 31) ? ty_llong : ty_int;
+   } else {
+     if (l && u)
+-      ty = ty_ulong;
++      ty = (val >> 32) ? ty_ullong : ty_ulong;
+     else if (l)
+-      ty = (val >> 63) ? ty_ulong : ty_long;
++      ty = (val >> 63) ? ty_ullong : (val >> 32) ? ty_llong : (val >> 31) ? ty_ulong : ty_long;
+     else if (u)
+-      ty = (val >> 32) ? ty_ulong : ty_uint;
++      ty = (val >> 32) ? ty_ullong : ty_uint;
+     else if (val >> 63)
+-      ty = ty_ulong;
++      ty = ty_ullong;
+     else if (val >> 32)
+-      ty = ty_long;
++      ty = ty_llong;
+     else if (val >> 31)
+       ty = ty_uint;
+     else
+--- /home/exedev/src/chibicc/preprocess.c	2026-09-04 17:10:36.846273790 +0000
++++ cc/preprocess.c	2026-09-04 17:44:47.312894343 +0000
+@@ -1061,18 +1061,23 @@
+   // Define predefined macros
+   define_macro("_LP64", "1");
+   define_macro("__C99_MACRO_WITH_VA_ARGS", "1");
+-  define_macro("__ELF__", "1");
+-  define_macro("__LP64__", "1");
++  define_macro("__ILP32__", "1");
++  define_macro("__LITTLE_ENDIAN__", "1");
++  define_macro("__ORDER_LITTLE_ENDIAN__", "1234");
++  define_macro("__ORDER_BIG_ENDIAN__", "4321");
++  define_macro("__BYTE_ORDER__", "1234");
++  define_macro("__wasm__", "1");
++  define_macro("__wasm32__", "1");
+   define_macro("__SIZEOF_DOUBLE__", "8");
+   define_macro("__SIZEOF_FLOAT__", "4");
+   define_macro("__SIZEOF_INT__", "4");
+   define_macro("__SIZEOF_LONG_DOUBLE__", "8");
+   define_macro("__SIZEOF_LONG_LONG__", "8");
+-  define_macro("__SIZEOF_LONG__", "8");
+-  define_macro("__SIZEOF_POINTER__", "8");
+-  define_macro("__SIZEOF_PTRDIFF_T__", "8");
++  define_macro("__SIZEOF_LONG__", "4");
++  define_macro("__SIZEOF_POINTER__", "4");
++  define_macro("__SIZEOF_PTRDIFF_T__", "4");
+   define_macro("__SIZEOF_SHORT__", "2");
+-  define_macro("__SIZEOF_SIZE_T__", "8");
++  define_macro("__SIZEOF_SIZE_T__", "4");
+   define_macro("__SIZE_TYPE__", "unsigned long");
+   define_macro("__STDC_HOSTED__", "1");
+   define_macro("__STDC_NO_COMPLEX__", "1");
+@@ -1082,21 +1087,12 @@
+   define_macro("__STDC__", "1");
+   define_macro("__USER_LABEL_PREFIX__", "");
+   define_macro("__alignof__", "_Alignof");
+-  define_macro("__amd64", "1");
+-  define_macro("__amd64__", "1");
+   define_macro("__chibicc__", "1");
+   define_macro("__const__", "const");
+-  define_macro("__gnu_linux__", "1");
+   define_macro("__inline__", "inline");
+-  define_macro("__linux", "1");
+-  define_macro("__linux__", "1");
+   define_macro("__signed__", "signed");
+   define_macro("__typeof__", "typeof");
+-  define_macro("__unix", "1");
+-  define_macro("__unix__", "1");
+   define_macro("__volatile__", "volatile");
+-  define_macro("__x86_64", "1");
+-  define_macro("__x86_64__", "1");
+   define_macro("linux", "1");
+   define_macro("unix", "1");
+ 
+--- /home/exedev/src/chibicc/chibicc.h	2026-09-04 17:10:36.846273790 +0000
++++ cc/chibicc.h	2026-09-04 17:37:31.247355061 +0000
+@@ -381,11 +381,13 @@
+ extern Type *ty_short;
+ extern Type *ty_int;
+ extern Type *ty_long;
++extern Type *ty_llong;
+ 
+ extern Type *ty_uchar;
+ extern Type *ty_ushort;
+ extern Type *ty_uint;
+ extern Type *ty_ulong;
++extern Type *ty_ullong;
+ 
+ extern Type *ty_float;
+ extern Type *ty_double;
+@@ -409,6 +411,8 @@
+ //
+ 
+ void codegen(Obj *prog, FILE *out);
++extern int opt_stack_size;
++extern int opt_max_pages;
+ int align_to(int n, int align);
+ 
+ //
+
+exec
+/bin/bash -lc "nl -ba cc/codegen.c | sed -n '1,260p'; nl -ba cc/codegen.c | sed -n '261,520p'; nl -ba cc/codegen.c | sed -n '521,780p'; nl -ba cc/codegen.c | sed -n '781,1040p'" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+     1	// wasm32 backend for chibicc. Replaces the x86-64 codegen.c.
+     2	//
+     3	// Model: every C local lives in linear memory on a shadow stack (so its
+     4	// address can be taken); expressions evaluate on the wasm operand stack.
+     5	// Value classes: integers/pointers of size <= 4 are i32, 8-byte integers
+     6	// are i64, float is f32, double and long double are f64. Struct-typed
+     7	// expressions evaluate to the struct's address (i32), as in chibicc.
+     8	//
+     9	// ABI (single translation unit, so only self-consistency matters):
+    10	//  - params are passed as wasm values; struct params as a pointer to the
+    11	//    caller's object, copied by the callee into its own frame;
+    12	//  - a function returning a struct takes a hidden first i32 pointer
+    13	//    (parse.c creates that local for every struct return);
+    14	//  - a variadic function takes one extra trailing i32: a pointer to the
+    15	//    variadic arguments, stored by the caller in 8-byte slots on the
+    16	//    shadow stack; va_list is a char*.
+    17	//  - function pointers are table indices (index+1, 0 is null).
+    18	//
+    19	// Control flow: if/for/while/do/switch (with fallthrough) map to wasm
+    20	// blocks. goto is supported only forward, to a label at the top level of
+    21	// the function body. No alloca, VLA, bitfields, TLS, atomics, asm,
+    22	// statement expressions, or labels-as-values.
+    23	#include "chibicc.h"
+    24	
+    25	int opt_stack_size = 1 << 20;
+    26	int opt_max_pages = 256;
+    27	
+    28	// ---- byte buffers ----
+    29	typedef struct { uint8_t *data; int len, cap; } Buf;
+    30	
+    31	static void buf_u8(Buf *b, int v) {
+    32	  if (b->len == b->cap) {
+    33	    b->cap = b->cap ? b->cap * 2 : 256;
+    34	    b->data = realloc(b->data, b->cap);
+    35	  }
+    36	  b->data[b->len++] = (uint8_t)v;
+    37	}
+    38	static void buf_bytes(Buf *b, void *p, int n) {
+    39	  for (int i = 0; i < n; i++) buf_u8(b, ((uint8_t *)p)[i]);
+    40	}
+    41	static void buf_uleb(Buf *b, uint64_t v) {
+    42	  do { int c = v & 0x7f; v >>= 7; buf_u8(b, v ? c | 0x80 : c); } while (v);
+    43	}
+    44	static void buf_sleb(Buf *b, int64_t v) {
+    45	  for (;;) {
+    46	    int c = v & 0x7f; v >>= 7;
+    47	    bool done = (v == 0 && !(c & 0x40)) || (v == -1 && (c & 0x40));
+    48	    buf_u8(b, done ? c : c | 0x80);
+    49	    if (done) return;
+    50	  }
+    51	}
+    52	static void buf_name(Buf *b, char *s) { buf_uleb(b, strlen(s)); buf_bytes(b, s, strlen(s)); }
+    53	static void buf_buf(Buf *b, Buf *src) { buf_bytes(b, src->data, src->len); }
+    54	static void buf_section(Buf *out, int id, Buf *content) {
+    55	  buf_u8(out, id); buf_uleb(out, content->len); buf_buf(out, content);
+    56	}
+    57	
+    58	// ---- value classes ----
+    59	enum { VC_NONE, VC_I32, VC_I64, VC_F32, VC_F64 };
+    60	static const uint8_t valtype[] = { 0, 0x7f, 0x7e, 0x7d, 0x7c };
+    61	
+    62	static int vclass(Type *ty) {
+    63	  if (!ty) return VC_NONE; // ND_NULL_EXPR / ND_MEMZERO carry no type
+    64	  switch (ty->kind) {
+    65	  case TY_VOID: return VC_NONE;
+    66	  case TY_FLOAT: return VC_F32;
+    67	  case TY_DOUBLE: case TY_LDOUBLE: return VC_F64;
+    68	  case TY_STRUCT: case TY_UNION: case TY_ARRAY: case TY_FUNC: case TY_PTR: case TY_VLA: return VC_I32;
+    69	  default: return ty->size == 8 ? VC_I64 : VC_I32;
+    70	  }
+    71	}
+    72	
+    73	// ---- opcodes ----
+    74	enum {
+    75	  OP_UNREACHABLE = 0x00, OP_BLOCK = 0x02, OP_LOOP = 0x03, OP_IF = 0x04, OP_ELSE = 0x05, OP_END = 0x0b,
+    76	  OP_BR = 0x0c, OP_BR_IF = 0x0d, OP_RETURN = 0x0f, OP_CALL = 0x10, OP_CALL_INDIRECT = 0x11,
+    77	  OP_DROP = 0x1a, OP_SELECT = 0x1b,
+    78	  OP_LOCAL_GET = 0x20, OP_LOCAL_SET = 0x21, OP_LOCAL_TEE = 0x22, OP_GLOBAL_GET = 0x23, OP_GLOBAL_SET = 0x24,
+    79	  OP_I32_LOAD = 0x28, OP_I64_LOAD = 0x29, OP_F32_LOAD = 0x2a, OP_F64_LOAD = 0x2b,
+    80	  OP_I32_LOAD8_S = 0x2c, OP_I32_LOAD8_U = 0x2d, OP_I32_LOAD16_S = 0x2e, OP_I32_LOAD16_U = 0x2f,
+    81	  OP_I32_STORE = 0x36, OP_I64_STORE = 0x37, OP_F32_STORE = 0x38, OP_F64_STORE = 0x39,
+    82	  OP_I32_STORE8 = 0x3a, OP_I32_STORE16 = 0x3b,
+    83	  OP_MEMORY_SIZE = 0x3f, OP_MEMORY_GROW = 0x40,
+    84	  OP_I32_CONST = 0x41, OP_I64_CONST = 0x42, OP_F32_CONST = 0x43, OP_F64_CONST = 0x44,
+    85	  OP_I32_EQZ = 0x45, OP_I32_EQ = 0x46, OP_I32_NE = 0x47, OP_I32_LT_S = 0x48, OP_I32_LT_U = 0x49,
+    86	  OP_I32_LE_S = 0x4c, OP_I32_LE_U = 0x4d,
+    87	  OP_I64_EQZ = 0x50, OP_I64_EQ = 0x51, OP_I64_NE = 0x52, OP_I64_LT_S = 0x53, OP_I64_LT_U = 0x54,
+    88	  OP_I64_LE_S = 0x57, OP_I64_LE_U = 0x58,
+    89	  OP_F32_EQ = 0x5b, OP_F32_NE = 0x5c, OP_F32_LT = 0x5d, OP_F32_LE = 0x5f,
+    90	  OP_F64_EQ = 0x61, OP_F64_NE = 0x62, OP_F64_LT = 0x63, OP_F64_LE = 0x65,
+    91	  OP_I32_ADD = 0x6a, OP_I32_SUB = 0x6b, OP_I32_MUL = 0x6c, OP_I32_DIV_S = 0x6d, OP_I32_DIV_U = 0x6e,
+    92	  OP_I32_REM_S = 0x6f, OP_I32_REM_U = 0x70, OP_I32_AND = 0x71, OP_I32_OR = 0x72, OP_I32_XOR = 0x73,
+    93	  OP_I32_SHL = 0x74, OP_I32_SHR_S = 0x75, OP_I32_SHR_U = 0x76,
+    94	  OP_I64_ADD = 0x7c, OP_I64_SUB = 0x7d, OP_I64_MUL = 0x7e, OP_I64_DIV_S = 0x7f, OP_I64_DIV_U = 0x80,
+    95	  OP_I64_REM_S = 0x81, OP_I64_REM_U = 0x82, OP_I64_AND = 0x83, OP_I64_OR = 0x84, OP_I64_XOR = 0x85,
+    96	  OP_I64_SHL = 0x86, OP_I64_SHR_S = 0x87, OP_I64_SHR_U = 0x88,
+    97	  OP_F32_NEG = 0x8c, OP_F32_ADD = 0x92, OP_F32_SUB = 0x93, OP_F32_MUL = 0x94, OP_F32_DIV = 0x95,
+    98	  OP_F64_NEG = 0x9a, OP_F64_ADD = 0xa0, OP_F64_SUB = 0xa1, OP_F64_MUL = 0xa2, OP_F64_DIV = 0xa3,
+    99	  OP_I32_WRAP_I64 = 0xa7, OP_I32_TRUNC_F32_S = 0xa8, OP_I32_TRUNC_F32_U = 0xa9,
+   100	  OP_I32_TRUNC_F64_S = 0xaa, OP_I32_TRUNC_F64_U = 0xab,
+   101	  OP_I64_EXTEND_I32_S = 0xac, OP_I64_EXTEND_I32_U = 0xad,
+   102	  OP_I64_TRUNC_F32_S = 0xae, OP_I64_TRUNC_F32_U = 0xaf, OP_I64_TRUNC_F64_S = 0xb0, OP_I64_TRUNC_F64_U = 0xb1,
+   103	  OP_F32_CONVERT_I32_S = 0xb2, OP_F32_CONVERT_I32_U = 0xb3, OP_F32_CONVERT_I64_S = 0xb4, OP_F32_CONVERT_I64_U = 0xb5,
+   104	  OP_F32_DEMOTE_F64 = 0xb6,
+   105	  OP_F64_CONVERT_I32_S = 0xb7, OP_F64_CONVERT_I32_U = 0xb8, OP_F64_CONVERT_I64_S = 0xb9, OP_F64_CONVERT_I64_U = 0xba,
+   106	  OP_F64_PROMOTE_F32 = 0xbb,
+   107	  OP_I32_EXTEND8_S = 0xc0, OP_I32_EXTEND16_S = 0xc1,
+   108	  OP_PREFIX_FC = 0xfc, // memory.copy = fc 0a 00 00, memory.fill = fc 0b 00
+   109	};
+   110	
+   111	// ---- module state ----
+   112	static Buf types;          // type section entries
+   113	static int ntypes;
+   114	static Buf *type_entries;  // each entry's bytes, for dedup
+   115	static int type_cap;
+   116	
+   117	static HashMap func_index; // name -> (long)index + 1
+   118	static Obj **funcs;        // by index
+   119	static int nfuncs, nimports;
+   120	static HashMap referenced; // function name -> referenced
+   121	
+   122	static int data_base = 1024;
+   123	static int data_end;       // end of initialised + zero globals
+   124	static int stack_top;      // initial $sp
+   125	static int heap_base;
+   126	
+   127	static Buf code;           // current function body
+   128	static Obj *current_fn;
+   129	static int frame_size;
+   130	static int loc_fp, loc_t32, loc_t32b, loc_t64, loc_tf32, loc_tf64, loc_rv;
+   131	
+   132	// control stack
+   133	typedef struct { char *label; int id; } Ctl;
+   134	static Ctl ctl[512];
+   135	static int ctl_len;
+   136	static int ctl_id_counter;
+   137	#define RET_LABEL ".ret"
+   138	
+   139	static void gen_expr(Node *node);
+   140	static void gen_stmt(Node *node);
+   141	static void gen_addr(Node *node);
+   142	
+   143	// ---- emit helpers ----
+   144	static void op(int o) { buf_u8(&code, o); }
+   145	static void op_u(int o, uint64_t v) { buf_u8(&code, o); buf_uleb(&code, v); }
+   146	static void i32c(int64_t v) { buf_u8(&code, OP_I32_CONST); buf_sleb(&code, (int32_t)v); }
+   147	static void i64c(int64_t v) { buf_u8(&code, OP_I64_CONST); buf_sleb(&code, v); }
+   148	static void f32c(float f) { buf_u8(&code, OP_F32_CONST); buf_bytes(&code, &f, 4); }
+   149	static void f64c(double d) { buf_u8(&code, OP_F64_CONST); buf_bytes(&code, &d, 8); }
+   150	static void memarg(int o, int align_log2) { buf_u8(&code, o); buf_uleb(&code, align_log2); buf_uleb(&code, 0); }
+   151	static void memory_copy(void) { op(OP_PREFIX_FC); buf_uleb(&code, 10); buf_u8(&code, 0); buf_u8(&code, 0); }
+   152	static void memory_fill(void) { op(OP_PREFIX_FC); buf_uleb(&code, 11); buf_u8(&code, 0); }
+   153	
+   154	static int push_ctl(char *label) {
+   155	  if (ctl_len == 512) error("control nesting too deep");
+   156	  ctl[ctl_len].label = label;
+   157	  ctl[ctl_len].id = ctl_id_counter++;
+   158	  ctl_len++;
+   159	  return ctl[ctl_len - 1].id;
+   160	}
+   161	static void pop_ctl(void) { ctl_len--; }
+   162	static int depth_of_label(char *label, Token *tok) {
+   163	  for (int i = ctl_len - 1; i >= 0; i--)
+   164	    if (ctl[i].label && !strcmp(ctl[i].label, label))
+   165	      return ctl_len - 1 - i;
+   166	  error_tok(tok, "unsupported control flow: no enclosing block for label %s "
+   167	            "(only forward goto to a top-level label is supported)", label);
+   168	}
+   169	static int depth_of_id(int id) {
+   170	  for (int i = ctl_len - 1; i >= 0; i--)
+   171	    if (ctl[i].id == id)
+   172	      return ctl_len - 1 - i;
+   173	  unreachable();
+   174	}
+   175	static void block(char *label, int blocktype) { op(OP_BLOCK); buf_u8(&code, blocktype); push_ctl(label); }
+   176	static int loop(void) { op(OP_LOOP); buf_u8(&code, 0x40); return push_ctl(NULL); }
+   177	static void if_(int blocktype) { op(OP_IF); buf_u8(&code, blocktype); push_ctl(NULL); }
+   178	static void end(void) { op(OP_END); pop_ctl(); }
+   179	static void br_label(char *label, Token *tok) { op_u(OP_BR, depth_of_label(label, tok)); }
+   180	static void br_if_label(char *label, Token *tok) { op_u(OP_BR_IF, depth_of_label(label, tok)); }
+   181	
+   182	// ---- function signatures ----
+   183	static int add_type_entry(Buf *e) {
+   184	  for (int i = 0; i < ntypes; i++)
+   185	    if (type_entries[i].len == e->len && !memcmp(type_entries[i].data, e->data, e->len))
+   186	      return i;
+   187	  if (ntypes == type_cap) {
+   188	    type_cap = type_cap ? type_cap * 2 : 64;
+   189	    type_entries = realloc(type_entries, type_cap * sizeof(Buf));
+   190	  }
+   191	  type_entries[ntypes] = *e;
+   192	  buf_buf(&types, e);
+   193	  return ntypes++;
+   194	}
+   195	
+   196	static bool is_struct(Type *ty) { return ty->kind == TY_STRUCT || ty->kind == TY_UNION; }
+   197	
+   198	static int sig_index(Type *fty) {
+   199	  Buf e = {0};
+   200	  buf_u8(&e, 0x60);
+   201	  int n = 0;
+   202	  Buf p = {0};
+   203	  if (is_struct(fty->return_ty)) { buf_u8(&p, 0x7f); n++; }
+   204	  for (Type *t = fty->params; t; t = t->next) { buf_u8(&p, valtype[vclass(t)]); n++; }
+   205	  if (fty->is_variadic) { buf_u8(&p, 0x7f); n++; }
+   206	  buf_uleb(&e, n); buf_buf(&e, &p);
+   207	  int rc = is_struct(fty->return_ty) ? VC_NONE : vclass(fty->return_ty);
+   208	  if (rc == VC_NONE) buf_u8(&e, 0);
+   209	  else { buf_u8(&e, 1); buf_u8(&e, valtype[rc]); }
+   210	  return add_type_entry(&e);
+   211	}
+   212	
+   213	// ---- function references (to decide which undefined functions become imports) ----
+   214	static void mark_refs(Node *n) {
+   215	  for (; n; n = n->next) {
+   216	    if (n->kind == ND_VAR && n->var->is_function)
+   217	      hashmap_put(&referenced, n->var->name, (void *)1);
+   218	    mark_refs(n->lhs); mark_refs(n->rhs); mark_refs(n->cond); mark_refs(n->then);
+   219	    mark_refs(n->els); mark_refs(n->init); mark_refs(n->inc); mark_refs(n->body);
+   220	    mark_refs(n->args);
+   221	  }
+   222	}
+   223	
+   224	static int func_idx(Obj *fn, Token *tok) {
+   225	  void *v = hashmap_get(&func_index, fn->name);
+   226	  if (!v) error_tok(tok, "function %s is neither defined nor an env import", fn->name);
+   227	  return (int)(long)v - 1;
+   228	}
+   229	
+   230	static HashMap global_def;  // name -> defining Obj (declarations are separate Objs in chibicc)
+   231	
+   232	static int global_addr(Obj *var, Token *tok) {
+   233	  if (var->is_function) return func_idx(var, tok) + 1; // table index
+   234	  Obj *def = hashmap_get(&global_def, var->name);
+   235	  if (!def) {
+   236	    if (!strcmp(var->name, "__heap_base")) return heap_base;
+   237	    error_tok(tok, "undefined global %s", var->name);
+   238	  }
+   239	  return def->offset;
+   240	}
+   241	
+   242	// ---- loads/stores ----
+   243	static int align_log2(int n) { int r = 0; while ((1 << r) < n && r < 3) r++; return r; }
+   244	
+   245	static void load(Type *ty) {
+   246	  switch (ty->kind) {
+   247	  case TY_ARRAY: case TY_STRUCT: case TY_UNION: case TY_FUNC: case TY_VLA: return;
+   248	  case TY_FLOAT: memarg(OP_F32_LOAD, 2); return;
+   249	  case TY_DOUBLE: case TY_LDOUBLE: memarg(OP_F64_LOAD, 3); return;
+   250	  default: break;
+   251	  }
+   252	  switch (ty->size) {
+   253	  case 1: memarg(ty->is_unsigned || ty->kind == TY_BOOL ? OP_I32_LOAD8_U : OP_I32_LOAD8_S, 0); return;
+   254	  case 2: memarg(ty->is_unsigned ? OP_I32_LOAD16_U : OP_I32_LOAD16_S, 1); return;
+   255	  case 4: memarg(OP_I32_LOAD, 2); return;
+   256	  case 8: memarg(OP_I64_LOAD, 3); return;
+   257	  }
+   258	  unreachable();
+   259	}
+   260	
+   261	static void store(Type *ty) {
+   262	  switch (ty->kind) {
+   263	  case TY_FLOAT: memarg(OP_F32_STORE, 2); return;
+   264	  case TY_DOUBLE: case TY_LDOUBLE: memarg(OP_F64_STORE, 3); return;
+   265	  default: break;
+   266	  }
+   267	  switch (ty->size) {
+   268	  case 1: memarg(OP_I32_STORE8, 0); return;
+   269	  case 2: memarg(OP_I32_STORE16, 1); return;
+   270	  case 4: memarg(OP_I32_STORE, 2); return;
+   271	  case 8: memarg(OP_I64_STORE, 3); return;
+   272	  }
+   273	  unreachable();
+   274	}
+   275	
+   276	// ---- casts ----
+   277	static void to_bool(int vc) {
+   278	  switch (vc) {
+   279	  case VC_I32: i32c(0); op(OP_I32_NE); return;
+   280	  case VC_I64: i64c(0); op(OP_I64_NE); return;
+   281	  case VC_F32: f32c(0); op(OP_F32_NE); return;
+   282	  case VC_F64: f64c(0); op(OP_F64_NE); return;
+   283	  }
+   284	}
+   285	
+   286	// value of class `from` on the stack -> class `to`
+   287	static void convert(int from, int to, bool from_unsigned) {
+   288	  if (from == to) return;
+   289	  switch (from) {
+   290	  case VC_I32:
+   291	    switch (to) {
+   292	    case VC_I64: op(from_unsigned ? OP_I64_EXTEND_I32_U : OP_I64_EXTEND_I32_S); return;
+   293	    case VC_F32: op(from_unsigned ? OP_F32_CONVERT_I32_U : OP_F32_CONVERT_I32_S); return;
+   294	    case VC_F64: op(from_unsigned ? OP_F64_CONVERT_I32_U : OP_F64_CONVERT_I32_S); return;
+   295	    }
+   296	    break;
+   297	  case VC_I64:
+   298	    switch (to) {
+   299	    case VC_I32: op(OP_I32_WRAP_I64); return;
+   300	    case VC_F32: op(from_unsigned ? OP_F32_CONVERT_I64_U : OP_F32_CONVERT_I64_S); return;
+   301	    case VC_F64: op(from_unsigned ? OP_F64_CONVERT_I64_U : OP_F64_CONVERT_I64_S); return;
+   302	    }
+   303	    break;
+   304	  case VC_F32:
+   305	    switch (to) {
+   306	    case VC_F64: op(OP_F64_PROMOTE_F32); return;
+   307	    case VC_I32: op(from_unsigned ? OP_I32_TRUNC_F32_U : OP_I32_TRUNC_F32_S); return;
+   308	    case VC_I64: op(from_unsigned ? OP_I64_TRUNC_F32_U : OP_I64_TRUNC_F32_S); return;
+   309	    }
+   310	    break;
+   311	  case VC_F64:
+   312	    switch (to) {
+   313	    case VC_F32: op(OP_F32_DEMOTE_F64); return;
+   314	    case VC_I32: op(from_unsigned ? OP_I32_TRUNC_F64_U : OP_I32_TRUNC_F64_S); return;
+   315	    case VC_I64: op(from_unsigned ? OP_I64_TRUNC_F64_U : OP_I64_TRUNC_F64_S); return;
+   316	    }
+   317	    break;
+   318	  }
+   319	  unreachable();
+   320	}
+   321	
+   322	// narrow an i32 to the representation of a small integer type
+   323	static void narrow(Type *to) {
+   324	  if (to->kind == TY_BOOL) return; // handled by caller
+   325	  switch (to->size) {
+   326	  case 1: if (to->is_unsigned) { i32c(0xff); op(OP_I32_AND); } else op(OP_I32_EXTEND8_S); return;
+   327	  case 2: if (to->is_unsigned) { i32c(0xffff); op(OP_I32_AND); } else op(OP_I32_EXTEND16_S); return;
+   328	  }
+   329	}
+   330	
+   331	static void cast(Type *from, Type *to) {
+   332	  int fc = vclass(from), tc = vclass(to);
+   333	  if (to->kind == TY_VOID) { if (fc != VC_NONE) op(OP_DROP); return; }
+   334	  if (to->kind == TY_BOOL) { to_bool(fc); return; }
+   335	  // when converting a float to a small integer, go through i32 with the target's signedness
+   336	  bool from_unsigned = from->is_unsigned || from->kind == TY_PTR || from->kind == TY_ARRAY;
+   337	  if ((fc == VC_F32 || fc == VC_F64) && (tc == VC_I32 || tc == VC_I64))
+   338	    from_unsigned = to->is_unsigned;
+   339	  convert(fc, tc, from_unsigned);
+   340	  if (tc == VC_I32 && is_integer(to) && to->size < 4)
+   341	    if (from->size > to->size || fc != VC_I32 || from->is_unsigned != to->is_unsigned)
+   342	      narrow(to);
+   343	}
+   344	
+   345	// generate expression and convert its value to class vc
+   346	static void gen_expr_as(Node *node, int vc) {
+   347	  gen_expr(node);
+   348	  convert(vclass(node->ty), vc, node->ty->is_unsigned || node->ty->kind == TY_PTR);
+   349	}
+   350	
+   351	// evaluate to an i32 that is 0 or 1
+   352	static void gen_cond(Node *node) {
+   353	  gen_expr(node);
+   354	  to_bool(vclass(node->ty));
+   355	}
+   356	
+   357	// ---- addresses ----
+   358	static void fp_plus(int off) {
+   359	  op_u(OP_LOCAL_GET, loc_fp);
+   360	  if (off) { i32c(off); op(OP_I32_ADD); }
+   361	}
+   362	
+   363	static void gen_addr(Node *node) {
+   364	  switch (node->kind) {
+   365	  case ND_VAR:
+   366	    if (node->var->ty->kind == TY_VLA) error_tok(node->tok, "VLA is not supported");
+   367	    if (node->var->is_local) { fp_plus(node->var->offset); return; }
+   368	    if (node->var->is_tls) error_tok(node->tok, "TLS is not supported");
+   369	    i32c(global_addr(node->var, node->tok));
+   370	    return;
+   371	  case ND_DEREF:
+   372	    gen_expr_as(node->lhs, VC_I32);
+   373	    return;
+   374	  case ND_COMMA:
+   375	    gen_expr(node->lhs);
+   376	    if (vclass(node->lhs->ty) != VC_NONE) op(OP_DROP);
+   377	    gen_addr(node->rhs);
+   378	    return;
+   379	  case ND_MEMBER:
+   380	    gen_addr(node->lhs);
+   381	    if (node->member->offset) { i32c(node->member->offset); op(OP_I32_ADD); }
+   382	    return;
+   383	  case ND_FUNCALL:
+   384	    if (node->ret_buffer) { gen_expr(node); return; }
+   385	    break;
+   386	  case ND_ASSIGN:
+   387	  case ND_COND:
+   388	    if (is_struct(node->ty)) { gen_expr(node); return; }
+   389	    break;
+   390	  default:
+   391	    break;
+   392	  }
+   393	  error_tok(node->tok, "not an lvalue");
+   394	}
+   395	
+   396	// ---- calls ----
+   397	static int count_params(Type *fty) { int n = 0; for (Type *t = fty->params; t; t = t->next) n++; return n; }
+   398	
+   399	static void gen_funcall(Node *node) {
+   400	  Type *fty = node->func_ty;
+   401	  Obj *callee = (node->lhs->kind == ND_VAR && node->lhs->var->is_function) ? node->lhs->var : NULL;
+   402	
+   403	  if (callee) {
+   404	    if (!strcmp(callee->name, "__builtin_wasm_memory_size")) {
+   405	      for (Node *a = node->args; a; a = a->next) { gen_expr(a); op(OP_DROP); }
+   406	      op(OP_MEMORY_SIZE); buf_u8(&code, 0);
+   407	      convert(VC_I32, vclass(node->ty), true);
+   408	      return;
+   409	    }
+   410	    if (!strcmp(callee->name, "__builtin_wasm_memory_grow")) {
+   411	      gen_expr(node->args); op(OP_DROP);
+   412	      gen_expr_as(node->args->next, VC_I32);
+   413	      op(OP_MEMORY_GROW); buf_u8(&code, 0);
+   414	      convert(VC_I32, vclass(node->ty), true);
+   415	      return;
+   416	    }
+   417	    if (!strcmp(callee->name, "alloca")) error_tok(node->tok, "alloca is not supported");
+   418	  }
+   419	
+   420	  if (node->ret_buffer) fp_plus(node->ret_buffer->offset);
+   421	
+   422	  int nfixed = count_params(fty);
+   423	  Node *arg = node->args;
+   424	  for (int i = 0; i < nfixed; i++, arg = arg->next) gen_expr(arg);
+   425	
+   426	  if (fty->is_variadic) {
+   427	    int nva = 0;
+   428	    for (Node *a = arg; a; a = a->next) nva++;
+   429	    int size = align_to(nva * 8, 16);
+   430	    if (size) {
+   431	      op_u(OP_GLOBAL_GET, 0); i32c(size); op(OP_I32_SUB); op_u(OP_GLOBAL_SET, 0);
+   432	    }
+   433	    int slot = 0;
+   434	    for (Node *a = arg; a; a = a->next, slot++) {
+   435	      if (is_struct(a->ty)) error_tok(a->tok, "passing a struct as a variadic argument is not supported");
+   436	      op_u(OP_GLOBAL_GET, 0);
+   437	      if (slot) { i32c(slot * 8); op(OP_I32_ADD); }
+   438	      gen_expr(a);
+   439	      switch (vclass(a->ty)) {
+   440	      case VC_I32: memarg(OP_I32_STORE, 2); break;
+   441	      case VC_I64: memarg(OP_I64_STORE, 3); break;
+   442	      case VC_F32: memarg(OP_F32_STORE, 2); break;
+   443	      case VC_F64: memarg(OP_F64_STORE, 3); break;
+   444	      default: unreachable();
+   445	      }
+   446	    }
+   447	    op_u(OP_GLOBAL_GET, 0); // the va pointer argument
+   448	    if (callee) op_u(OP_CALL, func_idx(callee, node->tok));
+   449	    else { gen_expr_as(node->lhs, VC_I32); op(OP_CALL_INDIRECT); buf_uleb(&code, sig_index(fty)); buf_u8(&code, 0); }
+   450	    if (size) {
+   451	      op_u(OP_GLOBAL_GET, 0); i32c(size); op(OP_I32_ADD); op_u(OP_GLOBAL_SET, 0);
+   452	    }
+   453	  } else {
+   454	    if (arg) error_tok(node->tok, "too many arguments");
+   455	    if (callee) op_u(OP_CALL, func_idx(callee, node->tok));
+   456	    else { gen_expr_as(node->lhs, VC_I32); op(OP_CALL_INDIRECT); buf_uleb(&code, sig_index(fty)); buf_u8(&code, 0); }
+   457	  }
+   458	
+   459	  if (node->ret_buffer) fp_plus(node->ret_buffer->offset);
+   460	}
+   461	
+   462	// ---- expressions ----
+   463	static int scratch_local(int vc) {
+   464	  switch (vc) {
+   465	  case VC_I32: return loc_t32;
+   466	  case VC_I64: return loc_t64;
+   467	  case VC_F32: return loc_tf32;
+   468	  case VC_F64: return loc_tf64;
+   469	  }
+   470	  unreachable();
+   471	}
+   472	
+   473	static void gen_binary(Node *node) {
+   474	  bool fl = is_flonum(node->lhs->ty);
+   475	  int vc = vclass(node->lhs->ty);
+   476	  bool u = node->lhs->ty->is_unsigned || node->lhs->ty->kind == TY_PTR || node->lhs->ty->kind == TY_ARRAY;
+   477	  bool cmp = node->kind == ND_EQ || node->kind == ND_NE || node->kind == ND_LT || node->kind == ND_LE;
+   478	  if (!cmp) vc = vclass(node->ty);
+   479	
+   480	  gen_expr_as(node->lhs, vc);
+   481	  gen_expr_as(node->rhs, vc);
+   482	
+   483	  if (fl) {
+   484	    bool d = vc == VC_F64;
+   485	    switch (node->kind) {
+   486	    case ND_ADD: op(d ? OP_F64_ADD : OP_F32_ADD); return;
+   487	    case ND_SUB: op(d ? OP_F64_SUB : OP_F32_SUB); return;
+   488	    case ND_MUL: op(d ? OP_F64_MUL : OP_F32_MUL); return;
+   489	    case ND_DIV: op(d ? OP_F64_DIV : OP_F32_DIV); return;
+   490	    case ND_EQ: op(d ? OP_F64_EQ : OP_F32_EQ); return;
+   491	    case ND_NE: op(d ? OP_F64_NE : OP_F32_NE); return;
+   492	    case ND_LT: op(d ? OP_F64_LT : OP_F32_LT); return;
+   493	    case ND_LE: op(d ? OP_F64_LE : OP_F32_LE); return;
+   494	    default: error_tok(node->tok, "invalid float operation");
+   495	    }
+   496	  }
+   497	  bool w = vc == VC_I64;
+   498	  switch (node->kind) {
+   499	  case ND_ADD: op(w ? OP_I64_ADD : OP_I32_ADD); return;
+   500	  case ND_SUB: op(w ? OP_I64_SUB : OP_I32_SUB); return;
+   501	  case ND_MUL: op(w ? OP_I64_MUL : OP_I32_MUL); return;
+   502	  case ND_DIV: op(w ? (u ? OP_I64_DIV_U : OP_I64_DIV_S) : (u ? OP_I32_DIV_U : OP_I32_DIV_S)); return;
+   503	  case ND_MOD: op(w ? (u ? OP_I64_REM_U : OP_I64_REM_S) : (u ? OP_I32_REM_U : OP_I32_REM_S)); return;
+   504	  case ND_BITAND: op(w ? OP_I64_AND : OP_I32_AND); return;
+   505	  case ND_BITOR: op(w ? OP_I64_OR : OP_I32_OR); return;
+   506	  case ND_BITXOR: op(w ? OP_I64_XOR : OP_I32_XOR); return;
+   507	  case ND_SHL: op(w ? OP_I64_SHL : OP_I32_SHL); return;
+   508	  case ND_SHR: op(w ? (u ? OP_I64_SHR_U : OP_I64_SHR_S) : (u ? OP_I32_SHR_U : OP_I32_SHR_S)); return;
+   509	  case ND_EQ: op(w ? OP_I64_EQ : OP_I32_EQ); return;
+   510	  case ND_NE: op(w ? OP_I64_NE : OP_I32_NE); return;
+   511	  case ND_LT: op(w ? (u ? OP_I64_LT_U : OP_I64_LT_S) : (u ? OP_I32_LT_U : OP_I32_LT_S)); return;
+   512	  case ND_LE: op(w ? (u ? OP_I64_LE_U : OP_I64_LE_S) : (u ? OP_I32_LE_U : OP_I32_LE_S)); return;
+   513	  default: unreachable();
+   514	  }
+   515	}
+   516	
+   517	static void gen_expr(Node *node) {
+   518	  switch (node->kind) {
+   519	  case ND_NULL_EXPR:
+   520	    return;
+   521	  case ND_NUM:
+   522	    switch (vclass(node->ty)) {
+   523	    case VC_F32: f32c((float)node->fval); return;
+   524	    case VC_F64: f64c((double)node->fval); return;
+   525	    case VC_I64: i64c(node->val); return;
+   526	    default: i32c(node->val); return;
+   527	    }
+   528	  case ND_NEG:
+   529	    switch (vclass(node->ty)) {
+   530	    case VC_F32: gen_expr(node->lhs); op(OP_F32_NEG); return;
+   531	    case VC_F64: gen_expr(node->lhs); op(OP_F64_NEG); return;
+   532	    case VC_I64: i64c(0); gen_expr_as(node->lhs, VC_I64); op(OP_I64_SUB); return;
+   533	    default: i32c(0); gen_expr_as(node->lhs, VC_I32); op(OP_I32_SUB); return;
+   534	    }
+   535	  case ND_VAR:
+   536	    gen_addr(node);
+   537	    load(node->ty);
+   538	    return;
+   539	  case ND_MEMBER:
+   540	    if (node->member->is_bitfield) error_tok(node->tok, "bitfields are not supported");
+   541	    gen_addr(node);
+   542	    load(node->ty);
+   543	    return;
+   544	  case ND_DEREF:
+   545	    gen_addr(node);
+   546	    load(node->ty);
+   547	    return;
+   548	  case ND_ADDR:
+   549	    gen_addr(node->lhs);
+   550	    return;
+   551	  case ND_ASSIGN: {
+   552	    if (node->lhs->kind == ND_MEMBER && node->lhs->member->is_bitfield)
+   553	      error_tok(node->tok, "bitfields are not supported");
+   554	    if (is_struct(node->ty)) {
+   555	      gen_addr(node->lhs);
+   556	      op_u(OP_LOCAL_TEE, loc_t32b);
+   557	      gen_expr(node->rhs);
+   558	      i32c(node->ty->size);
+   559	      memory_copy();
+   560	      op_u(OP_LOCAL_GET, loc_t32b);
+   561	      return;
+   562	    }
+   563	    int vc = vclass(node->ty);
+   564	    gen_addr(node->lhs);
+   565	    gen_expr_as(node->rhs, vc);
+   566	    op_u(OP_LOCAL_TEE, scratch_local(vc));
+   567	    store(node->ty);
+   568	    op_u(OP_LOCAL_GET, scratch_local(vc));
+   569	    return;
+   570	  }
+   571	  case ND_STMT_EXPR:
+   572	    error_tok(node->tok, "statement expressions are not supported");
+   573	  case ND_COMMA:
+   574	    gen_expr(node->lhs);
+   575	    if (vclass(node->lhs->ty) != VC_NONE) op(OP_DROP);
+   576	    gen_expr(node->rhs);
+   577	    return;
+   578	  case ND_CAST:
+   579	    gen_expr(node->lhs);
+   580	    cast(node->lhs->ty, node->ty);
+   581	    return;
+   582	  case ND_MEMZERO:
+   583	    fp_plus(node->var->offset);
+   584	    i32c(0);
+   585	    i32c(node->var->ty->size);
+   586	    memory_fill();
+   587	    return;
+   588	  case ND_COND: {
+   589	    int vc = vclass(node->ty);
+   590	    gen_cond(node->cond);
+   591	    if_(vc == VC_NONE ? 0x40 : valtype[vc]);
+   592	    gen_expr_as(node->then, vc);
+   593	    op(OP_ELSE);
+   594	    gen_expr_as(node->els, vc);
+   595	    end();
+   596	    return;
+   597	  }
+   598	  case ND_NOT:
+   599	    gen_cond(node->lhs);
+   600	    op(OP_I32_EQZ);
+   601	    return;
+   602	  case ND_BITNOT:
+   603	    if (vclass(node->ty) == VC_I64) { gen_expr_as(node->lhs, VC_I64); i64c(-1); op(OP_I64_XOR); }
+   604	    else { gen_expr_as(node->lhs, VC_I32); i32c(-1); op(OP_I32_XOR); }
+   605	    return;
+   606	  case ND_LOGAND:
+   607	    gen_cond(node->lhs);
+   608	    if_(0x7f);
+   609	    gen_cond(node->rhs);
+   610	    op(OP_ELSE);
+   611	    i32c(0);
+   612	    end();
+   613	    return;
+   614	  case ND_LOGOR:
+   615	    gen_cond(node->lhs);
+   616	    if_(0x7f);
+   617	    i32c(1);
+   618	    op(OP_ELSE);
+   619	    gen_cond(node->rhs);
+   620	    end();
+   621	    return;
+   622	  case ND_FUNCALL:
+   623	    gen_funcall(node);
+   624	    return;
+   625	  case ND_ADD: case ND_SUB: case ND_MUL: case ND_DIV: case ND_MOD:
+   626	  case ND_BITAND: case ND_BITOR: case ND_BITXOR: case ND_SHL: case ND_SHR:
+   627	  case ND_EQ: case ND_NE: case ND_LT: case ND_LE:
+   628	    gen_binary(node);
+   629	    return;
+   630	  case ND_LABEL_VAL: case ND_CAS: case ND_EXCH: case ND_VLA_PTR:
+   631	    error_tok(node->tok, "unsupported expression");
+   632	  default:
+   633	    error_tok(node->tok, "invalid expression");
+   634	  }
+   635	}
+   636	
+   637	// ---- statements ----
+   638	static void collect_cases(Node *n, Node **out, int *count, int max, Token *tok) {
+   639	  // cases at the top level of the switch body, in source order; a case's
+   640	  // lhs may itself be a case (case 1: case 2: stmt)
+   641	  for (; n; n = n->next)
+   642	    for (Node *c = n; c->kind == ND_CASE; c = c->lhs) {
+   643	      if (*count == max) error_tok(tok, "too many cases");
+   644	      out[(*count)++] = c;
+   645	    }
+   646	}
+   647	
+   648	static void gen_switch(Node *node) {
+   649	  int vc = vclass(node->cond->ty);
+   650	  gen_expr(node->cond);
+   651	  op_u(OP_LOCAL_SET, scratch_local(vc));
+   652	
+   653	  Node *cases[1024];
+   654	  int ncases = 0;
+   655	  Node *body = node->then;
+   656	  if (body->kind == ND_BLOCK) collect_cases(body->body, cases, &ncases, 1024, node->tok);
+   657	  else collect_cases(body, cases, &ncases, 1024, node->tok);
+   658	
+   659	  block(node->brk_label, 0x40);
+   660	  for (int i = ncases - 1; i >= 0; i--) block(cases[i]->label, 0x40);
+   661	
+   662	  for (Node *c = node->case_next; c; c = c->case_next) {
+   663	    op_u(OP_LOCAL_GET, scratch_local(vc));
+   664	    if (c->begin == c->end) {
+   665	      if (vc == VC_I64) { i64c(c->begin); op(OP_I64_EQ); } else { i32c(c->begin); op(OP_I32_EQ); }
+   666	    } else {
+   667	      if (vc == VC_I64) { i64c(c->begin); op(OP_I64_SUB); i64c(c->end - c->begin); op(OP_I64_LE_U); }
+   668	      else { i32c(c->begin); op(OP_I32_SUB); i32c(c->end - c->begin); op(OP_I32_LE_U); }
+   669	    }
+   670	    br_if_label(c->label, c->tok);
+   671	  }
+   672	  br_label(node->default_case ? node->default_case->label : node->brk_label, node->tok);
+   673	
+   674	  gen_stmt(node->then);
+   675	  // every case block must have been closed by its ND_CASE
+   676	  if (ctl_len == 0 || !ctl[ctl_len - 1].label || strcmp(ctl[ctl_len - 1].label, node->brk_label))
+   677	    error_tok(node->tok, "unsupported switch shape (a case is nested inside another statement)");
+   678	  end();
+   679	}
+   680	
+   681	static void gen_stmt(Node *node) {
+   682	  switch (node->kind) {
+   683	  case ND_BLOCK:
+   684	    for (Node *n = node->body; n; n = n->next) gen_stmt(n);
+   685	    return;
+   686	  case ND_EXPR_STMT:
+   687	    gen_expr(node->lhs);
+   688	    if (vclass(node->lhs->ty) != VC_NONE) op(OP_DROP);
+   689	    return;
+   690	  case ND_IF:
+   691	    gen_cond(node->cond);
+   692	    if_(0x40);
+   693	    gen_stmt(node->then);
+   694	    if (node->els) { op(OP_ELSE); gen_stmt(node->els); }
+   695	    end();
+   696	    return;
+   697	  case ND_FOR: {
+   698	    if (node->init) gen_stmt(node->init);
+   699	    block(node->brk_label, 0x40);
+   700	    int top = loop();
+   701	    if (node->cond) { gen_cond(node->cond); op(OP_I32_EQZ); br_if_label(node->brk_label, node->tok); }
+   702	    block(node->cont_label, 0x40);
+   703	    gen_stmt(node->then);
+   704	    end();
+   705	    if (node->inc) { gen_expr(node->inc); if (vclass(node->inc->ty) != VC_NONE) op(OP_DROP); }
+   706	    op_u(OP_BR, depth_of_id(top));
+   707	    end();
+   708	    end();
+   709	    return;
+   710	  }
+   711	  case ND_DO: {
+   712	    block(node->brk_label, 0x40);
+   713	    int top = loop();
+   714	    block(node->cont_label, 0x40);
+   715	    gen_stmt(node->then);
+   716	    end();
+   717	    gen_cond(node->cond);
+   718	    op_u(OP_BR_IF, depth_of_id(top));
+   719	    end();
+   720	    end();
+   721	    return;
+   722	  }
+   723	  case ND_SWITCH:
+   724	    gen_switch(node);
+   725	    return;
+   726	  case ND_CASE:
+   727	    if (ctl_len == 0 || !ctl[ctl_len - 1].label || strcmp(ctl[ctl_len - 1].label, node->label))
+   728	      error_tok(node->tok, "unsupported switch shape (case nested inside another statement)");
+   729	    end();
+   730	    gen_stmt(node->lhs);
+   731	    return;
+   732	  case ND_GOTO:
+   733	    br_label(node->unique_label, node->tok);
+   734	    return;
+   735	  case ND_LABEL:
+   736	    if (ctl_len == 0 || !ctl[ctl_len - 1].label || strcmp(ctl[ctl_len - 1].label, node->unique_label))
+   737	      error_tok(node->tok, "unsupported label position (labels must be at the top level of the function body)");
+   738	    end();
+   739	    gen_stmt(node->lhs);
+   740	    return;
+   741	  case ND_RETURN:
+   742	    if (node->lhs) {
+   743	      Type *ty = node->lhs->ty;
+   744	      if (is_struct(ty)) {
+   745	        op_u(OP_LOCAL_GET, 0); // hidden return pointer
+   746	        gen_expr(node->lhs);
+   747	        i32c(ty->size);
+   748	        memory_copy();
+   749	      } else {
+   750	        gen_expr_as(node->lhs, vclass(current_fn->ty->return_ty));
+   751	        op_u(OP_LOCAL_SET, loc_rv);
+   752	      }
+   753	    }
+   754	    br_label(RET_LABEL, node->tok);
+   755	    return;
+   756	  case ND_GOTO_EXPR: case ND_ASM:
+   757	    error_tok(node->tok, "unsupported statement");
+   758	  default:
+   759	    error_tok(node->tok, "invalid statement");
+   760	  }
+   761	}
+   762	
+   763	// ---- functions ----
+   764	static void assign_lvar_offsets(Obj *fn) {
+   765	  int off = 0;
+   766	  for (Obj *var = fn->locals; var; var = var->next) {
+   767	    if (var->ty->kind == TY_VLA) error_tok(var->tok, "VLA is not supported");
+   768	    int align = var->align < 1 ? 1 : var->align;
+   769	    off = align_to(off, align);
+   770	    var->offset = off;
+   771	    off += var->ty->size;
+   772	  }
+   773	  frame_size = align_to(off, 16);
+   774	}
+   775	
+   776	static void gen_function(Obj *fn, Buf *out) {
+   777	  current_fn = fn;
+   778	  code.len = 0;
+   779	  ctl_len = 0;
+   780	  assign_lvar_offsets(fn);
+   781	
+   782	  int nparams = 0;
+   783	  for (Obj *p = fn->params; p; p = p->next) nparams++;
+   784	  if (fn->ty->is_variadic) nparams++;
+   785	  loc_fp = nparams; loc_t32 = nparams + 1; loc_t32b = nparams + 2;
+   786	  loc_t64 = nparams + 3; loc_tf32 = nparams + 4; loc_tf64 = nparams + 5; loc_rv = nparams + 6;
+   787	  int rc = is_struct(fn->ty->return_ty) ? VC_NONE : vclass(fn->ty->return_ty);
+   788	
+   789	  // prologue: fp = sp - frame; sp = fp
+   790	  op_u(OP_GLOBAL_GET, 0);
+   791	  if (frame_size) { i32c(frame_size); op(OP_I32_SUB); }
+   792	  op_u(OP_LOCAL_TEE, loc_fp);
+   793	  op_u(OP_GLOBAL_SET, 0);
+   794	
+   795	  // spill parameters into their frame slots
+   796	  int i = 0;
+   797	  for (Obj *p = fn->params; p; p = p->next, i++) {
+   798	    if (is_struct(p->ty)) {
+   799	      fp_plus(p->offset); op_u(OP_LOCAL_GET, i); i32c(p->ty->size); memory_copy();
+   800	    } else {
+   801	      fp_plus(p->offset); op_u(OP_LOCAL_GET, i); store(p->ty);
+   802	    }
+   803	  }
+   804	  if (fn->ty->is_variadic) {
+   805	    fp_plus(fn->va_area->offset); op_u(OP_LOCAL_GET, i); memarg(OP_I32_STORE, 2);
+   806	  }
+   807	
+   808	  // blocks for forward gotos to top-level labels
+   809	  Node *body = fn->body;
+   810	  Node *labels[256];
+   811	  int nlabels = 0;
+   812	  if (body->kind == ND_BLOCK)
+   813	    for (Node *n = body->body; n; n = n->next)
+   814	      if (n->kind == ND_LABEL) {
+   815	        if (nlabels == 256) error_tok(n->tok, "too many labels");
+   816	        labels[nlabels++] = n;
+   817	      }
+   818	  block(RET_LABEL, 0x40);
+   819	  for (int k = nlabels - 1; k >= 0; k--) block(labels[k]->unique_label, 0x40);
+   820	
+   821	  gen_stmt(body);
+   822	
+   823	  // unclosed label blocks (label never reached at top level) would be a bug
+   824	  if (ctl_len != 1) error_tok(fn->tok, "internal error: unbalanced control stack in %s", fn->name);
+   825	  end();
+   826	
+   827	  // epilogue: sp = fp + frame
+   828	  op_u(OP_LOCAL_GET, loc_fp);
+   829	  if (frame_size) { i32c(frame_size); op(OP_I32_ADD); }
+   830	  op_u(OP_GLOBAL_SET, 0);
+   831	  if (rc != VC_NONE) op_u(OP_LOCAL_GET, loc_rv);
+   832	  op(OP_END);
+   833	
+   834	  // function body: locals declaration + code
+   835	  Buf body_buf = {0};
+   836	  buf_uleb(&body_buf, rc == VC_NONE ? 4 : 5);
+   837	  buf_uleb(&body_buf, 3); buf_u8(&body_buf, 0x7f);
+   838	  buf_uleb(&body_buf, 1); buf_u8(&body_buf, 0x7e);
+   839	  buf_uleb(&body_buf, 1); buf_u8(&body_buf, 0x7d);
+   840	  buf_uleb(&body_buf, 1); buf_u8(&body_buf, 0x7c);
+   841	  if (rc != VC_NONE) { buf_uleb(&body_buf, 1); buf_u8(&body_buf, valtype[rc]); }
+   842	  buf_buf(&body_buf, &code);
+   843	  buf_uleb(out, body_buf.len);
+   844	  buf_buf(out, &body_buf);
+   845	  free(body_buf.data);
+   846	}
+   847	
+   848	// ---- data ----
+   849	static void layout_globals(Obj *prog) {
+   850	  int addr = data_base;
+   851	  // initialised globals first, then zero-initialised ones, so one data segment covers the former;
+   852	  // one storage location per name (a tentative definition repeated in several headers is one object)
+   853	  for (int pass = 0; pass < 2; pass++) {
+   854	    for (Obj *var = prog; var; var = var->next) {
+   855	      if (var->is_function || !var->is_definition) continue;
+   856	      if ((var->init_data != NULL) != (pass == 0)) continue;
+   857	      if (hashmap_get(&global_def, var->name)) {
+   858	        if (var->init_data) error_tok(var->tok, "redefinition of %s", var->name);
+   859	        continue;
+   860	      }
+   861	      hashmap_put(&global_def, var->name, var);
+   862	      int align = var->align < 1 ? 1 : var->align;
+   863	      addr = align_to(addr, align);
+   864	      var->offset = addr;
+   865	      addr += var->ty->size;
+   866	    }
+   867	    if (pass == 0) data_end = addr;
+   868	  }
+   869	  int bss_end = addr;
+   870	  int stack_bottom = align_to(bss_end, 16);
+   871	  stack_top = stack_bottom + opt_stack_size;
+   872	  heap_base = stack_top;
+   873	}
+   874	
+   875	static void emit_data(Obj *prog, Buf *sec) {
+   876	  int n = data_end - data_base;
+   877	  uint8_t *img = calloc(1, n ? n : 1);
+   878	  for (Obj *var = prog; var; var = var->next) {
+   879	    if (var->is_function || !var->is_definition || !var->init_data) continue;
+   880	    if (hashmap_get(&global_def, var->name) != var) continue;
+   881	    memcpy(img + var->offset - data_base, var->init_data, var->ty->size);
+   882	    for (Relocation *rel = var->rel; rel; rel = rel->next) {
+   883	      Obj *target = NULL;
+   884	      for (Obj *o = prog; o; o = o->next)
+   885	        if (!strcmp(o->name, *rel->label)) { target = o; break; }
+   886	      if (!target) error("relocation to unknown symbol %s", *rel->label);
+   887	      uint32_t v = (uint32_t)(global_addr(target, var->tok) + rel->addend);
+   888	      memcpy(img + var->offset - data_base + rel->offset, &v, 4);
+   889	    }
+   890	  }
+   891	  buf_uleb(sec, 1);               // one segment
+   892	  buf_u8(sec, 0);                 // active, memory 0
+   893	  buf_u8(sec, OP_I32_CONST); buf_sleb(sec, data_base); buf_u8(sec, OP_END);
+   894	  buf_uleb(sec, n);
+   895	  buf_bytes(sec, img, n);
+   896	  free(img);
+   897	}
+   898	
+   899	int align_to(int n, int align) { return (n + align - 1) / align * align; }
+   900	
+   901	void codegen(Obj *prog, FILE *out) {
+   902	  // the parser prepends, so prog is in reverse source order; reverse it for stable numbering
+   903	  Obj *rev = NULL;
+   904	  for (Obj *o = prog; o;) { Obj *next = o->next; o->next = rev; rev = o; o = next; }
+   905	  prog = rev;
+   906	
+   907	  for (Obj *fn = prog; fn; fn = fn->next)
+   908	    if (fn->is_function && fn->is_definition) mark_refs(fn->body);
+   909	  for (Obj *var = prog; var; var = var->next)
+   910	    if (!var->is_function && var->is_definition)
+   911	      for (Relocation *rel = var->rel; rel; rel = rel->next)
+   912	        hashmap_put(&referenced, *rel->label, (void *)1);
+   913	
+   914	  // number functions: env imports first, then definitions
+   915	  Buf imports = {0}, funcsec = {0};
+   916	  int cap = 64;
+   917	  funcs = calloc(cap, sizeof(Obj *));
+   918	  for (int pass = 0; pass < 2; pass++) {
+   919	    for (Obj *fn = prog; fn; fn = fn->next) {
+   920	      if (!fn->is_function) continue;
+   921	      if (pass == 0) {
+   922	        if (fn->is_definition || !hashmap_get(&referenced, fn->name)) continue;
+   923	        if (!strncmp(fn->name, "__builtin_", 10)) continue; // handled inline by gen_funcall
+   924	        if (strncmp(fn->name, "__env_", 6)) error_tok(fn->tok, "undefined function %s (env imports must be named __env_*)", fn->name);
+   925	        buf_name(&imports, "env"); buf_name(&imports, fn->name + 6);
+   926	        buf_u8(&imports, 0); buf_uleb(&imports, sig_index(fn->ty));
+   927	      } else {
+   928	        if (!fn->is_definition) continue;
+   929	        buf_uleb(&funcsec, sig_index(fn->ty));
+   930	      }
+   931	      if (nfuncs == cap) { cap *= 2; funcs = realloc(funcs, cap * sizeof(Obj *)); }
+   932	      funcs[nfuncs] = fn;
+   933	      hashmap_put(&func_index, fn->name, (void *)(long)(nfuncs + 1));
+   934	      nfuncs++;
+   935	    }
+   936	    if (pass == 0) nimports = nfuncs;
+   937	  }
+   938	
+   939	  layout_globals(prog);
+   940	
+   941	  Buf codesec = {0};
+   942	  buf_uleb(&codesec, nfuncs - nimports);
+   943	  for (int i = nimports; i < nfuncs; i++) gen_function(funcs[i], &codesec);
+   944	
+   945	  Buf mod = {0};
+   946	  buf_bytes(&mod, "\0asm\1\0\0\0", 8);
+   947	
+   948	  Buf s = {0};
+   949	  buf_uleb(&s, ntypes); buf_buf(&s, &types);
+   950	  buf_section(&mod, 1, &s);
+   951	
+   952	  if (nimports) {
+   953	    s.len = 0; buf_uleb(&s, nimports); buf_buf(&s, &imports);
+   954	    buf_section(&mod, 2, &s);
+   955	  }
+   956	
+   957	  s.len = 0; buf_uleb(&s, nfuncs - nimports); buf_buf(&s, &funcsec);
+   958	  buf_section(&mod, 3, &s);
+   959	
+   960	  s.len = 0; buf_uleb(&s, 1); buf_u8(&s, 0x70); buf_u8(&s, 1); buf_uleb(&s, nfuncs + 1); buf_uleb(&s, nfuncs + 1);
+   961	  buf_section(&mod, 4, &s);
+   962	
+   963	  int min_pages = (heap_base + 65535) / 65536;
+   964	  if (min_pages > opt_max_pages) error("initial memory (%d pages) exceeds -mmaxpages=%d", min_pages, opt_max_pages);
+   965	  s.len = 0; buf_uleb(&s, 1); buf_u8(&s, 1); buf_uleb(&s, min_pages); buf_uleb(&s, opt_max_pages);
+   966	  buf_section(&mod, 5, &s);
+   967	
+   968	  s.len = 0; buf_uleb(&s, 1); buf_u8(&s, 0x7f); buf_u8(&s, 1);
+   969	  buf_u8(&s, OP_I32_CONST); buf_sleb(&s, stack_top); buf_u8(&s, OP_END);
+   970	  buf_section(&mod, 6, &s);
+   971	
+   972	  s.len = 0;
+   973	  int nexports = 1;
+   974	  void *start = hashmap_get(&func_index, "_start");
+   975	  if (start) nexports++;
+   976	  buf_uleb(&s, nexports);
+   977	  buf_name(&s, "memory"); buf_u8(&s, 2); buf_uleb(&s, 0);
+   978	  if (start) { buf_name(&s, "_start"); buf_u8(&s, 0); buf_uleb(&s, (int)(long)start - 1); }
+   979	  buf_section(&mod, 7, &s);
+   980	
+   981	  s.len = 0; buf_uleb(&s, 1); buf_u8(&s, 0);
+   982	  buf_u8(&s, OP_I32_CONST); buf_sleb(&s, 1); buf_u8(&s, OP_END);
+   983	  buf_uleb(&s, nfuncs);
+   984	  for (int i = 0; i < nfuncs; i++) buf_uleb(&s, i);
+   985	  buf_section(&mod, 9, &s);
+   986	
+   987	  buf_section(&mod, 10, &codesec);
+   988	
+   989	  s.len = 0; emit_data(prog, &s);
+   990	  buf_section(&mod, 11, &s);
+   991	
+   992	  fwrite(mod.data, 1, mod.len, out);
+   993	}
+
+exec
+/bin/bash -lc "nl -ba cc/codegen.c | sed -n '390,520p'; nl -ba libc/include/stdarg.h; rg -n \"__chibicc__|va_arg|va_list|struct|long double\" libc/libc.h libc/libc.c libc/stdio.c cc/main.c" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+   390	  default:
+   391	    break;
+   392	  }
+   393	  error_tok(node->tok, "not an lvalue");
+   394	}
+   395	
+   396	// ---- calls ----
+   397	static int count_params(Type *fty) { int n = 0; for (Type *t = fty->params; t; t = t->next) n++; return n; }
+   398	
+   399	static void gen_funcall(Node *node) {
+   400	  Type *fty = node->func_ty;
+   401	  Obj *callee = (node->lhs->kind == ND_VAR && node->lhs->var->is_function) ? node->lhs->var : NULL;
+   402	
+   403	  if (callee) {
+   404	    if (!strcmp(callee->name, "__builtin_wasm_memory_size")) {
+   405	      for (Node *a = node->args; a; a = a->next) { gen_expr(a); op(OP_DROP); }
+   406	      op(OP_MEMORY_SIZE); buf_u8(&code, 0);
+   407	      convert(VC_I32, vclass(node->ty), true);
+   408	      return;
+   409	    }
+   410	    if (!strcmp(callee->name, "__builtin_wasm_memory_grow")) {
+   411	      gen_expr(node->args); op(OP_DROP);
+   412	      gen_expr_as(node->args->next, VC_I32);
+   413	      op(OP_MEMORY_GROW); buf_u8(&code, 0);
+   414	      convert(VC_I32, vclass(node->ty), true);
+   415	      return;
+   416	    }
+   417	    if (!strcmp(callee->name, "alloca")) error_tok(node->tok, "alloca is not supported");
+   418	  }
+   419	
+   420	  if (node->ret_buffer) fp_plus(node->ret_buffer->offset);
+   421	
+   422	  int nfixed = count_params(fty);
+   423	  Node *arg = node->args;
+   424	  for (int i = 0; i < nfixed; i++, arg = arg->next) gen_expr(arg);
+   425	
+   426	  if (fty->is_variadic) {
+   427	    int nva = 0;
+   428	    for (Node *a = arg; a; a = a->next) nva++;
+   429	    int size = align_to(nva * 8, 16);
+   430	    if (size) {
+   431	      op_u(OP_GLOBAL_GET, 0); i32c(size); op(OP_I32_SUB); op_u(OP_GLOBAL_SET, 0);
+   432	    }
+   433	    int slot = 0;
+   434	    for (Node *a = arg; a; a = a->next, slot++) {
+   435	      if (is_struct(a->ty)) error_tok(a->tok, "passing a struct as a variadic argument is not supported");
+   436	      op_u(OP_GLOBAL_GET, 0);
+   437	      if (slot) { i32c(slot * 8); op(OP_I32_ADD); }
+   438	      gen_expr(a);
+   439	      switch (vclass(a->ty)) {
+   440	      case VC_I32: memarg(OP_I32_STORE, 2); break;
+   441	      case VC_I64: memarg(OP_I64_STORE, 3); break;
+   442	      case VC_F32: memarg(OP_F32_STORE, 2); break;
+   443	      case VC_F64: memarg(OP_F64_STORE, 3); break;
+   444	      default: unreachable();
+   445	      }
+   446	    }
+   447	    op_u(OP_GLOBAL_GET, 0); // the va pointer argument
+   448	    if (callee) op_u(OP_CALL, func_idx(callee, node->tok));
+   449	    else { gen_expr_as(node->lhs, VC_I32); op(OP_CALL_INDIRECT); buf_uleb(&code, sig_index(fty)); buf_u8(&code, 0); }
+   450	    if (size) {
+   451	      op_u(OP_GLOBAL_GET, 0); i32c(size); op(OP_I32_ADD); op_u(OP_GLOBAL_SET, 0);
+   452	    }
+   453	  } else {
+   454	    if (arg) error_tok(node->tok, "too many arguments");
+   455	    if (callee) op_u(OP_CALL, func_idx(callee, node->tok));
+   456	    else { gen_expr_as(node->lhs, VC_I32); op(OP_CALL_INDIRECT); buf_uleb(&code, sig_index(fty)); buf_u8(&code, 0); }
+   457	  }
+   458	
+   459	  if (node->ret_buffer) fp_plus(node->ret_buffer->offset);
+   460	}
+   461	
+   462	// ---- expressions ----
+   463	static int scratch_local(int vc) {
+   464	  switch (vc) {
+   465	  case VC_I32: return loc_t32;
+   466	  case VC_I64: return loc_t64;
+   467	  case VC_F32: return loc_tf32;
+   468	  case VC_F64: return loc_tf64;
+   469	  }
+   470	  unreachable();
+   471	}
+   472	
+   473	static void gen_binary(Node *node) {
+   474	  bool fl = is_flonum(node->lhs->ty);
+   475	  int vc = vclass(node->lhs->ty);
+   476	  bool u = node->lhs->ty->is_unsigned || node->lhs->ty->kind == TY_PTR || node->lhs->ty->kind == TY_ARRAY;
+   477	  bool cmp = node->kind == ND_EQ || node->kind == ND_NE || node->kind == ND_LT || node->kind == ND_LE;
+   478	  if (!cmp) vc = vclass(node->ty);
+   479	
+   480	  gen_expr_as(node->lhs, vc);
+   481	  gen_expr_as(node->rhs, vc);
+   482	
+   483	  if (fl) {
+   484	    bool d = vc == VC_F64;
+   485	    switch (node->kind) {
+   486	    case ND_ADD: op(d ? OP_F64_ADD : OP_F32_ADD); return;
+   487	    case ND_SUB: op(d ? OP_F64_SUB : OP_F32_SUB); return;
+   488	    case ND_MUL: op(d ? OP_F64_MUL : OP_F32_MUL); return;
+   489	    case ND_DIV: op(d ? OP_F64_DIV : OP_F32_DIV); return;
+   490	    case ND_EQ: op(d ? OP_F64_EQ : OP_F32_EQ); return;
+   491	    case ND_NE: op(d ? OP_F64_NE : OP_F32_NE); return;
+   492	    case ND_LT: op(d ? OP_F64_LT : OP_F32_LT); return;
+   493	    case ND_LE: op(d ? OP_F64_LE : OP_F32_LE); return;
+   494	    default: error_tok(node->tok, "invalid float operation");
+   495	    }
+   496	  }
+   497	  bool w = vc == VC_I64;
+   498	  switch (node->kind) {
+   499	  case ND_ADD: op(w ? OP_I64_ADD : OP_I32_ADD); return;
+   500	  case ND_SUB: op(w ? OP_I64_SUB : OP_I32_SUB); return;
+   501	  case ND_MUL: op(w ? OP_I64_MUL : OP_I32_MUL); return;
+   502	  case ND_DIV: op(w ? (u ? OP_I64_DIV_U : OP_I64_DIV_S) : (u ? OP_I32_DIV_U : OP_I32_DIV_S)); return;
+   503	  case ND_MOD: op(w ? (u ? OP_I64_REM_U : OP_I64_REM_S) : (u ? OP_I32_REM_U : OP_I32_REM_S)); return;
+   504	  case ND_BITAND: op(w ? OP_I64_AND : OP_I32_AND); return;
+   505	  case ND_BITOR: op(w ? OP_I64_OR : OP_I32_OR); return;
+   506	  case ND_BITXOR: op(w ? OP_I64_XOR : OP_I32_XOR); return;
+   507	  case ND_SHL: op(w ? OP_I64_SHL : OP_I32_SHL); return;
+   508	  case ND_SHR: op(w ? (u ? OP_I64_SHR_U : OP_I64_SHR_S) : (u ? OP_I32_SHR_U : OP_I32_SHR_S)); return;
+   509	  case ND_EQ: op(w ? OP_I64_EQ : OP_I32_EQ); return;
+   510	  case ND_NE: op(w ? OP_I64_NE : OP_I32_NE); return;
+   511	  case ND_LT: op(w ? (u ? OP_I64_LT_U : OP_I64_LT_S) : (u ? OP_I32_LT_U : OP_I32_LT_S)); return;
+   512	  case ND_LE: op(w ? (u ? OP_I64_LE_U : OP_I64_LE_S) : (u ? OP_I32_LE_U : OP_I32_LE_S)); return;
+   513	  default: unreachable();
+   514	  }
+   515	}
+   516	
+   517	static void gen_expr(Node *node) {
+   518	  switch (node->kind) {
+   519	  case ND_NULL_EXPR:
+   520	    return;
+     1	#ifndef _STDARG_H
+     2	#define _STDARG_H
+     3	#ifdef __chibicc__
+     4	/* chibicc-wasm ABI: variadic arguments live in 8-byte slots behind a pointer */
+     5	typedef char* va_list;
+     6	#define va_start(ap, last) ((ap) = __va_area__)
+     7	#define va_end(ap) ((void)0)
+     8	#define va_arg(ap, t) (*(t*)(((ap) += 8) - 8))
+     9	#else
+    10	typedef __builtin_va_list va_list;
+    11	#define va_start(ap, last) __builtin_va_start(ap, last)
+    12	#define va_end(ap) __builtin_va_end(ap)
+    13	#define va_arg(ap, t) __builtin_va_arg(ap, t)
+    14	#endif
+    15	#endif
+cc/main.c:14:  struct stat st;
+libc/libc.h:14:#ifdef __chibicc__
+libc/stdio.c:93:typedef struct { FILE* f; char* s; } Sink;
+libc/stdio.c:97:static int format(Sink* k, const char* fmt, va_list ap) {
+libc/stdio.c:111:        case 's': body = va_arg(ap, const char*); if (!body) body = "(null)"; len = (int)strlen(body); if (prec >= 0 && len > prec) len = prec; break;
+libc/stdio.c:112:        case 'c': num[0] = (char)va_arg(ap, int); body = num; len = 1; break;
+libc/stdio.c:115:            long long sv = longs >= 2 ? va_arg(ap, long long) : (long long)va_arg(ap, int);
+libc/stdio.c:119:        case 'u': v = longs >= 2 ? va_arg(ap, unsigned long long) : (unsigned long long)va_arg(ap, unsigned); base = 10; break;
+libc/stdio.c:121:        case 'x': v = longs >= 2 ? va_arg(ap, unsigned long long) : (unsigned long long)va_arg(ap, unsigned); base = 16; break;
+libc/stdio.c:136:int vfprintf(FILE* f, const char* fmt, va_list ap) { Sink k = { f, 0 }; return format(&k, fmt, ap); }
+libc/stdio.c:137:int fprintf(FILE* f, const char* fmt, ...) { va_list ap; int r; va_start(ap, fmt); r = vfprintf(f, fmt, ap); va_end(ap); return r; }
+libc/stdio.c:138:int printf(const char* fmt, ...) { va_list ap; int r; va_start(ap, fmt); r = vfprintf(stdout, fmt, ap); va_end(ap); return r; }
+libc/stdio.c:140:    va_list ap; int r; Sink k = { 0, buf };
+
+exec
+/bin/bash -lc "nl -ba libc/libc.h | sed -n '1,60p'; nl -ba cc/type.c | sed -n '1,330p'; nl -ba cc/tokenize.c | sed -n '315,425p'; nl -ba cc/main.c" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+     1	/* Minimal libc for wasm32 guests. Imports: env.read, env.write, env.exit. */
+     2	#ifndef MINLIBC_H
+     3	#define MINLIBC_H
+     4	typedef unsigned long size_t;
+     5	typedef long ssize_t;
+     6	typedef unsigned char uint8_t;
+     7	typedef unsigned int uint32_t;
+     8	typedef unsigned long long uint64_t;
+     9	typedef int int32_t;
+    10	typedef long long int64_t;
+    11	#define NULL ((void*)0)
+    12	
+    13	/* host imports: env.read, env.write, env.exit */
+    14	#ifdef __chibicc__
+    15	/* chibicc-wasm: an undefined function named __env_X is imported as env.X;
+    16	   attributes are not parsed, and wasm builtins are ordinary declarations. */
+    17	#define __attribute__(x)
+    18	int __env_read(int fd, void* buf, int n);
+    19	int __env_write(int fd, const void* buf, int n);
+    20	void __env_exit(int code);
+    21	#define sys_read __env_read
+    22	#define sys_write __env_write
+    23	#define sys_exit __env_exit
+    24	unsigned long __builtin_wasm_memory_size(int mem);
+    25	unsigned long __builtin_wasm_memory_grow(int mem, unsigned long pages);
+    26	#else
+    27	__attribute__((import_module("env"), import_name("read")))  int  sys_read(int fd, void* buf, int n);
+    28	__attribute__((import_module("env"), import_name("write"))) int  sys_write(int fd, const void* buf, int n);
+    29	__attribute__((import_module("env"), import_name("exit")))  void sys_exit(int code) __attribute__((noreturn));
+    30	#endif
+    31	
+    32	ssize_t read(int fd, void* buf, size_t n);
+    33	ssize_t write(int fd, const void* buf, size_t n);
+    34	void _exit(int code) __attribute__((noreturn));
+    35	void* malloc(size_t n);
+    36	void* calloc(size_t n, size_t m);
+    37	void* realloc(void* p, size_t n);
+    38	void free(void* p);
+    39	void* memcpy(void* d, const void* s, size_t n);
+    40	void* memmove(void* d, const void* s, size_t n);
+    41	void* memset(void* d, int c, size_t n);
+    42	int memcmp(const void* a, const void* b, size_t n);
+    43	size_t strlen(const char* s);
+    44	int strcmp(const char* a, const char* b);
+    45	char* strcpy(char* d, const char* s);
+    46	#endif
+     1	#include "chibicc.h"
+     2	
+     3	Type *ty_void = &(Type){TY_VOID, 1, 1};
+     4	Type *ty_bool = &(Type){TY_BOOL, 1, 1};
+     5	
+     6	Type *ty_char = &(Type){TY_CHAR, 1, 1};
+     7	Type *ty_short = &(Type){TY_SHORT, 2, 2};
+     8	Type *ty_int = &(Type){TY_INT, 4, 4};
+     9	Type *ty_long = &(Type){TY_LONG, 4, 4};
+    10	Type *ty_llong = &(Type){TY_LONG, 8, 8};
+    11	
+    12	Type *ty_uchar = &(Type){TY_CHAR, 1, 1, true};
+    13	Type *ty_ushort = &(Type){TY_SHORT, 2, 2, true};
+    14	Type *ty_uint = &(Type){TY_INT, 4, 4, true};
+    15	Type *ty_ulong = &(Type){TY_LONG, 4, 4, true};
+    16	Type *ty_ullong = &(Type){TY_LONG, 8, 8, true};
+    17	
+    18	Type *ty_float = &(Type){TY_FLOAT, 4, 4};
+    19	Type *ty_double = &(Type){TY_DOUBLE, 8, 8};
+    20	Type *ty_ldouble = &(Type){TY_LDOUBLE, 8, 8};
+    21	
+    22	static Type *new_type(TypeKind kind, int size, int align) {
+    23	  Type *ty = calloc(1, sizeof(Type));
+    24	  ty->kind = kind;
+    25	  ty->size = size;
+    26	  ty->align = align;
+    27	  return ty;
+    28	}
+    29	
+    30	bool is_integer(Type *ty) {
+    31	  TypeKind k = ty->kind;
+    32	  return k == TY_BOOL || k == TY_CHAR || k == TY_SHORT ||
+    33	         k == TY_INT  || k == TY_LONG || k == TY_ENUM;
+    34	}
+    35	
+    36	bool is_flonum(Type *ty) {
+    37	  return ty->kind == TY_FLOAT || ty->kind == TY_DOUBLE ||
+    38	         ty->kind == TY_LDOUBLE;
+    39	}
+    40	
+    41	bool is_numeric(Type *ty) {
+    42	  return is_integer(ty) || is_flonum(ty);
+    43	}
+    44	
+    45	bool is_compatible(Type *t1, Type *t2) {
+    46	  if (t1 == t2)
+    47	    return true;
+    48	
+    49	  if (t1->origin)
+    50	    return is_compatible(t1->origin, t2);
+    51	
+    52	  if (t2->origin)
+    53	    return is_compatible(t1, t2->origin);
+    54	
+    55	  if (t1->kind != t2->kind)
+    56	    return false;
+    57	
+    58	  switch (t1->kind) {
+    59	  case TY_CHAR:
+    60	  case TY_SHORT:
+    61	  case TY_INT:
+    62	  case TY_LONG:
+    63	    return t1->is_unsigned == t2->is_unsigned;
+    64	  case TY_FLOAT:
+    65	  case TY_DOUBLE:
+    66	  case TY_LDOUBLE:
+    67	    return true;
+    68	  case TY_PTR:
+    69	    return is_compatible(t1->base, t2->base);
+    70	  case TY_FUNC: {
+    71	    if (!is_compatible(t1->return_ty, t2->return_ty))
+    72	      return false;
+    73	    if (t1->is_variadic != t2->is_variadic)
+    74	      return false;
+    75	
+    76	    Type *p1 = t1->params;
+    77	    Type *p2 = t2->params;
+    78	    for (; p1 && p2; p1 = p1->next, p2 = p2->next)
+    79	      if (!is_compatible(p1, p2))
+    80	        return false;
+    81	    return p1 == NULL && p2 == NULL;
+    82	  }
+    83	  case TY_ARRAY:
+    84	    if (!is_compatible(t1->base, t2->base))
+    85	      return false;
+    86	    return t1->array_len < 0 && t2->array_len < 0 &&
+    87	           t1->array_len == t2->array_len;
+    88	  }
+    89	  return false;
+    90	}
+    91	
+    92	Type *copy_type(Type *ty) {
+    93	  Type *ret = calloc(1, sizeof(Type));
+    94	  *ret = *ty;
+    95	  ret->origin = ty;
+    96	  return ret;
+    97	}
+    98	
+    99	Type *pointer_to(Type *base) {
+   100	  Type *ty = new_type(TY_PTR, 4, 4);
+   101	  ty->base = base;
+   102	  ty->is_unsigned = true;
+   103	  return ty;
+   104	}
+   105	
+   106	Type *func_type(Type *return_ty) {
+   107	  // The C spec disallows sizeof(<function type>), but
+   108	  // GCC allows that and the expression is evaluated to 1.
+   109	  Type *ty = new_type(TY_FUNC, 1, 1);
+   110	  ty->return_ty = return_ty;
+   111	  return ty;
+   112	}
+   113	
+   114	Type *array_of(Type *base, int len) {
+   115	  Type *ty = new_type(TY_ARRAY, base->size * len, base->align);
+   116	  ty->base = base;
+   117	  ty->array_len = len;
+   118	  return ty;
+   119	}
+   120	
+   121	Type *vla_of(Type *base, Node *len) {
+   122	  Type *ty = new_type(TY_VLA, 4, 4);
+   123	  ty->base = base;
+   124	  ty->vla_len = len;
+   125	  return ty;
+   126	}
+   127	
+   128	Type *enum_type(void) {
+   129	  return new_type(TY_ENUM, 4, 4);
+   130	}
+   131	
+   132	Type *struct_type(void) {
+   133	  return new_type(TY_STRUCT, 0, 1);
+   134	}
+   135	
+   136	static Type *get_common_type(Type *ty1, Type *ty2) {
+   137	  if (ty1->base)
+   138	    return pointer_to(ty1->base);
+   139	
+   140	  if (ty1->kind == TY_FUNC)
+   141	    return pointer_to(ty1);
+   142	  if (ty2->kind == TY_FUNC)
+   143	    return pointer_to(ty2);
+   144	
+   145	  if (ty1->kind == TY_LDOUBLE || ty2->kind == TY_LDOUBLE)
+   146	    return ty_ldouble;
+   147	  if (ty1->kind == TY_DOUBLE || ty2->kind == TY_DOUBLE)
+   148	    return ty_double;
+   149	  if (ty1->kind == TY_FLOAT || ty2->kind == TY_FLOAT)
+   150	    return ty_float;
+   151	
+   152	  if (ty1->size < 4)
+   153	    ty1 = ty_int;
+   154	  if (ty2->size < 4)
+   155	    ty2 = ty_int;
+   156	
+   157	  if (ty1->size != ty2->size)
+   158	    return (ty1->size < ty2->size) ? ty2 : ty1;
+   159	
+   160	  if (ty2->is_unsigned)
+   161	    return ty2;
+   162	  return ty1;
+   163	}
+   164	
+   165	// For many binary operators, we implicitly promote operands so that
+   166	// both operands have the same type. Any integral type smaller than
+   167	// int is always promoted to int. If the type of one operand is larger
+   168	// than the other's (e.g. "long" vs. "int"), the smaller operand will
+   169	// be promoted to match with the other.
+   170	//
+   171	// This operation is called the "usual arithmetic conversion".
+   172	static void usual_arith_conv(Node **lhs, Node **rhs) {
+   173	  Type *ty = get_common_type((*lhs)->ty, (*rhs)->ty);
+   174	  *lhs = new_cast(*lhs, ty);
+   175	  *rhs = new_cast(*rhs, ty);
+   176	}
+   177	
+   178	void add_type(Node *node) {
+   179	  if (!node || node->ty)
+   180	    return;
+   181	
+   182	  add_type(node->lhs);
+   183	  add_type(node->rhs);
+   184	  add_type(node->cond);
+   185	  add_type(node->then);
+   186	  add_type(node->els);
+   187	  add_type(node->init);
+   188	  add_type(node->inc);
+   189	
+   190	  for (Node *n = node->body; n; n = n->next)
+   191	    add_type(n);
+   192	  for (Node *n = node->args; n; n = n->next)
+   193	    add_type(n);
+   194	
+   195	  switch (node->kind) {
+   196	  case ND_NUM:
+   197	    node->ty = ty_int;
+   198	    return;
+   199	  case ND_ADD:
+   200	  case ND_SUB:
+   201	  case ND_MUL:
+   202	  case ND_DIV:
+   203	  case ND_MOD:
+   204	  case ND_BITAND:
+   205	  case ND_BITOR:
+   206	  case ND_BITXOR:
+   207	    usual_arith_conv(&node->lhs, &node->rhs);
+   208	    node->ty = node->lhs->ty;
+   209	    return;
+   210	  case ND_NEG: {
+   211	    Type *ty = get_common_type(ty_int, node->lhs->ty);
+   212	    node->lhs = new_cast(node->lhs, ty);
+   213	    node->ty = ty;
+   214	    return;
+   215	  }
+   216	  case ND_ASSIGN:
+   217	    if (node->lhs->ty->kind == TY_ARRAY)
+   218	      error_tok(node->lhs->tok, "not an lvalue");
+   219	    if (node->lhs->ty->kind != TY_STRUCT)
+   220	      node->rhs = new_cast(node->rhs, node->lhs->ty);
+   221	    node->ty = node->lhs->ty;
+   222	    return;
+   223	  case ND_EQ:
+   224	  case ND_NE:
+   225	  case ND_LT:
+   226	  case ND_LE:
+   227	    usual_arith_conv(&node->lhs, &node->rhs);
+   228	    node->ty = ty_int;
+   229	    return;
+   230	  case ND_FUNCALL:
+   231	    node->ty = node->func_ty->return_ty;
+   232	    return;
+   233	  case ND_NOT:
+   234	  case ND_LOGOR:
+   235	  case ND_LOGAND:
+   236	    node->ty = ty_int;
+   237	    return;
+   238	  case ND_BITNOT:
+   239	  case ND_SHL:
+   240	  case ND_SHR:
+   241	    node->ty = node->lhs->ty;
+   242	    return;
+   243	  case ND_VAR:
+   244	  case ND_VLA_PTR:
+   245	    node->ty = node->var->ty;
+   246	    return;
+   247	  case ND_COND:
+   248	    if (node->then->ty->kind == TY_VOID || node->els->ty->kind == TY_VOID) {
+   249	      node->ty = ty_void;
+   250	    } else {
+   251	      usual_arith_conv(&node->then, &node->els);
+   252	      node->ty = node->then->ty;
+   253	    }
+   254	    return;
+   255	  case ND_COMMA:
+   256	    node->ty = node->rhs->ty;
+   257	    return;
+   258	  case ND_MEMBER:
+   259	    node->ty = node->member->ty;
+   260	    return;
+   261	  case ND_ADDR: {
+   262	    Type *ty = node->lhs->ty;
+   263	    if (ty->kind == TY_ARRAY)
+   264	      node->ty = pointer_to(ty->base);
+   265	    else
+   266	      node->ty = pointer_to(ty);
+   267	    return;
+   268	  }
+   269	  case ND_DEREF:
+   270	    if (!node->lhs->ty->base)
+   271	      error_tok(node->tok, "invalid pointer dereference");
+   272	    if (node->lhs->ty->base->kind == TY_VOID)
+   273	      error_tok(node->tok, "dereferencing a void pointer");
+   274	
+   275	    node->ty = node->lhs->ty->base;
+   276	    return;
+   277	  case ND_STMT_EXPR:
+   278	    if (node->body) {
+   279	      Node *stmt = node->body;
+   280	      while (stmt->next)
+   281	        stmt = stmt->next;
+   282	      if (stmt->kind == ND_EXPR_STMT) {
+   283	        node->ty = stmt->lhs->ty;
+   284	        return;
+   285	      }
+   286	    }
+   287	    error_tok(node->tok, "statement expression returning void is not supported");
+   288	    return;
+   289	  case ND_LABEL_VAL:
+   290	    node->ty = pointer_to(ty_void);
+   291	    return;
+   292	  case ND_CAS:
+   293	    add_type(node->cas_addr);
+   294	    add_type(node->cas_old);
+   295	    add_type(node->cas_new);
+   296	    node->ty = ty_bool;
+   297	
+   298	    if (node->cas_addr->ty->kind != TY_PTR)
+   299	      error_tok(node->cas_addr->tok, "pointer expected");
+   300	    if (node->cas_old->ty->kind != TY_PTR)
+   301	      error_tok(node->cas_old->tok, "pointer expected");
+   302	    return;
+   303	  case ND_EXCH:
+   304	    if (node->lhs->ty->kind != TY_PTR)
+   305	      error_tok(node->cas_addr->tok, "pointer expected");
+   306	    node->ty = node->lhs->ty->base;
+   307	    return;
+   308	  }
+   309	}
+   315	  Token *tok = new_token(TK_STR, start, end + 1);
+   316	  tok->ty = array_of(ty, len + 1);
+   317	  tok->str = (char *)buf;
+   318	  return tok;
+   319	}
+   320	
+   321	static Token *read_char_literal(char *start, char *quote, Type *ty) {
+   322	  char *p = quote + 1;
+   323	  if (*p == '\0')
+   324	    error_at(start, "unclosed char literal");
+   325	
+   326	  int c;
+   327	  if (*p == '\\')
+   328	    c = read_escaped_char(&p, p + 1);
+   329	  else
+   330	    c = decode_utf8(&p, p);
+   331	
+   332	  char *end = strchr(p, '\'');
+   333	  if (!end)
+   334	    error_at(p, "unclosed char literal");
+   335	
+   336	  Token *tok = new_token(TK_NUM, start, end + 1);
+   337	  tok->val = c;
+   338	  tok->ty = ty;
+   339	  return tok;
+   340	}
+   341	
+   342	static bool convert_pp_int(Token *tok) {
+   343	  char *p = tok->loc;
+   344	
+   345	  // Read a binary, octal, decimal or hexadecimal number.
+   346	  int base = 10;
+   347	  if (!strncasecmp(p, "0x", 2) && isxdigit(p[2])) {
+   348	    p += 2;
+   349	    base = 16;
+   350	  } else if (!strncasecmp(p, "0b", 2) && (p[2] == '0' || p[2] == '1')) {
+   351	    p += 2;
+   352	    base = 2;
+   353	  } else if (*p == '0') {
+   354	    base = 8;
+   355	  }
+   356	
+   357	  int64_t val = strtoul(p, &p, base);
+   358	
+   359	  // Read U, L or LL suffixes.
+   360	  bool l = false;
+   361	  bool u = false;
+   362	  bool ll = false;
+   363	
+   364	  if (startswith(p, "LLU") || startswith(p, "LLu") ||
+   365	      startswith(p, "llU") || startswith(p, "llu") ||
+   366	      startswith(p, "ULL") || startswith(p, "Ull") ||
+   367	      startswith(p, "uLL") || startswith(p, "ull")) {
+   368	    p += 3;
+   369	    l = u = ll = true;
+   370	  } else if (!strncasecmp(p, "lu", 2) || !strncasecmp(p, "ul", 2)) {
+   371	    p += 2;
+   372	    l = u = true;
+   373	  } else if (startswith(p, "LL") || startswith(p, "ll")) {
+   374	    p += 2;
+   375	    l = ll = true;
+   376	  } else if (*p == 'L' || *p == 'l') {
+   377	    p++;
+   378	    l = true;
+   379	  } else if (*p == 'U' || *p == 'u') {
+   380	    p++;
+   381	    u = true;
+   382	  }
+   383	
+   384	  if (p != tok->loc + tok->len)
+   385	    return false;
+   386	
+   387	  // Infer a type (ILP32: int and long are 4 bytes, long long is 8).
+   388	  Type *ty;
+   389	  if (ll) {
+   390	    ty = u ? ty_ullong : (base != 10 && (val >> 63)) ? ty_ullong : ty_llong;
+   391	  } else if (base == 10) {
+   392	    if (l && u)
+   393	      ty = (val >> 32) ? ty_ullong : ty_ulong;
+   394	    else if (l)
+   395	      ty = (val >> 31) ? ty_llong : ty_long;
+   396	    else if (u)
+   397	      ty = (val >> 32) ? ty_ullong : ty_uint;
+   398	    else
+   399	      ty = (val >> 31) ? ty_llong : ty_int;
+   400	  } else {
+   401	    if (l && u)
+   402	      ty = (val >> 32) ? ty_ullong : ty_ulong;
+   403	    else if (l)
+   404	      ty = (val >> 63) ? ty_ullong : (val >> 32) ? ty_llong : (val >> 31) ? ty_ulong : ty_long;
+   405	    else if (u)
+   406	      ty = (val >> 32) ? ty_ullong : ty_uint;
+   407	    else if (val >> 63)
+   408	      ty = ty_ullong;
+   409	    else if (val >> 32)
+   410	      ty = ty_llong;
+   411	    else if (val >> 31)
+   412	      ty = ty_uint;
+   413	    else
+   414	      ty = ty_int;
+   415	  }
+   416	
+   417	  tok->kind = TK_NUM;
+   418	  tok->val = val;
+   419	  tok->ty = ty;
+   420	  return true;
+   421	}
+   422	
+   423	// The definition of the numeric literal at the preprocessing stage
+   424	// is more relaxed than the definition of that at the later stages.
+   425	// In order to handle that, a numeric literal is tokenized as a
+     1	// Driver for the wasm backend: one translation unit in, one .wasm out.
+     2	#include "chibicc.h"
+     3	
+     4	StringArray include_paths;
+     5	bool opt_fpic;
+     6	bool opt_fcommon = true;
+     7	char *base_file;
+     8	
+     9	static bool opt_E;
+    10	static char *opt_o;
+    11	static char *input_path;
+    12	
+    13	bool file_exists(char *path) {
+    14	  struct stat st;
+    15	  return !stat(path, &st);
+    16	}
+    17	
+    18	static void define_arg(char *str) {
+    19	  char *eq = strchr(str, '=');
+    20	  if (eq)
+    21	    define_macro(strndup(str, eq - str), eq + 1);
+    22	  else
+    23	    define_macro(str, "1");
+    24	}
+    25	
+    26	static void usage(int status) {
+    27	  fprintf(stderr, "usage: cc [-E] [-I<dir>] [-D<macro>[=val]] [-mstack=<bytes>] [-mmaxpages=<n>] -o <out.wasm> <input.c>\n");
+    28	  exit(status);
+    29	}
+    30	
+    31	static void parse_args(int argc, char **argv) {
+    32	  for (int i = 1; i < argc; i++) {
+    33	    if (!strcmp(argv[i], "-o")) { if (!argv[++i]) usage(1); opt_o = argv[i]; continue; }
+    34	    if (!strncmp(argv[i], "-o", 2)) { opt_o = argv[i] + 2; continue; }
+    35	    if (!strcmp(argv[i], "-E")) { opt_E = true; continue; }
+    36	    if (!strcmp(argv[i], "-I")) { if (!argv[++i]) usage(1); strarray_push(&include_paths, argv[i]); continue; }
+    37	    if (!strncmp(argv[i], "-I", 2)) { strarray_push(&include_paths, argv[i] + 2); continue; }
+    38	    if (!strcmp(argv[i], "-D")) { if (!argv[++i]) usage(1); define_arg(argv[i]); continue; }
+    39	    if (!strncmp(argv[i], "-D", 2)) { define_arg(argv[i] + 2); continue; }
+    40	    if (!strncmp(argv[i], "-mstack=", 8)) { opt_stack_size = atoi(argv[i] + 8); continue; }
+    41	    if (!strncmp(argv[i], "-mmaxpages=", 11)) { opt_max_pages = atoi(argv[i] + 11); continue; }
+    42	    if (!strcmp(argv[i], "--help")) usage(0);
+    43	    if (argv[i][0] == '-' && argv[i][1]) error("unknown argument: %s", argv[i]);
+    44	    if (input_path) error("only one input file is supported");
+    45	    input_path = argv[i];
+    46	  }
+    47	  if (!input_path) error("no input file");
+    48	}
+    49	
+    50	static void print_tokens(Token *tok) {
+    51	  int line = 1;
+    52	  for (; tok->kind != TK_EOF; tok = tok->next) {
+    53	    if (line > 1 && tok->at_bol) printf("\n");
+    54	    if (tok->has_space && !tok->at_bol) printf(" ");
+    55	    printf("%.*s", tok->len, tok->loc);
+    56	    line++;
+    57	  }
+    58	  printf("\n");
+    59	}
+    60	
+    61	int main(int argc, char **argv) {
+    62	  init_macros();
+    63	  parse_args(argc, argv);
+    64	  base_file = input_path;
+    65	
+    66	  Token *tok = tokenize_file(input_path);
+    67	  if (!tok) error("%s: %s", input_path, strerror(errno));
+    68	  tok = preprocess(tok);
+    69	
+    70	  if (opt_E) { print_tokens(tok); return 0; }
+    71	
+    72	  Obj *prog = parse(tok);
+    73	  FILE *out = opt_o ? fopen(opt_o, "wb") : stdout;
+    74	  if (!out) error("cannot open output file: %s: %s", opt_o, strerror(errno));
+    75	  codegen(prog, out);
+    76	  fclose(out);
+    77	  return 0;
+    78	}
+
+exec
+/bin/bash -lc "rg -n \"funcall\\(|default argument|is_variadic|oldstyle|params =|return_ty|new_add|new_sub|case ND_SHL|case ND_SHR|TY_BOOL|TY_LDOUBLE\" cc/parse.c cc/type.c cc/tokenize.c | head -200; nl -ba cc/parse.c | sed -n '3030,3260p'; nl -ba cc/parse.c | sed -n '2360,2490p'; nl -ba cc/parse.c | sed -n '560,700p'" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+cc/type.c:4:Type *ty_bool = &(Type){TY_BOOL, 1, 1};
+cc/type.c:20:Type *ty_ldouble = &(Type){TY_LDOUBLE, 8, 8};
+cc/type.c:32:  return k == TY_BOOL || k == TY_CHAR || k == TY_SHORT ||
+cc/type.c:38:         ty->kind == TY_LDOUBLE;
+cc/type.c:66:  case TY_LDOUBLE:
+cc/type.c:71:    if (!is_compatible(t1->return_ty, t2->return_ty))
+cc/type.c:73:    if (t1->is_variadic != t2->is_variadic)
+cc/type.c:106:Type *func_type(Type *return_ty) {
+cc/type.c:110:  ty->return_ty = return_ty;
+cc/type.c:145:  if (ty1->kind == TY_LDOUBLE || ty2->kind == TY_LDOUBLE)
+cc/type.c:231:    node->ty = node->func_ty->return_ty;
+cc/type.c:239:  case ND_SHL:
+cc/type.c:240:  case ND_SHR:
+cc/parse.c:143:static Node *new_add(Node *lhs, Node *rhs, Token *tok);
+cc/parse.c:144:static Node *new_sub(Node *lhs, Node *rhs, Token *tok);
+cc/parse.c:151:static Node *funcall(Token **rest, Token *tok, Node *node);
+cc/parse.c:586:// func-params = ("void" | param ("," param)* ("," "...")?)? ")"
+cc/parse.c:596:  bool is_variadic = false;
+cc/parse.c:603:      is_variadic = true;
+cc/parse.c:630:    is_variadic = true;
+cc/parse.c:633:  ty->params = head.next;
+cc/parse.c:634:  ty->is_variadic = is_variadic;
+cc/parse.c:841:  node->ty = builtin_alloca->ty->return_ty;
+cc/parse.c:1332:  return new_unary(ND_DEREF, new_add(lhs, rhs, tok), tok);
+cc/parse.c:1561:    Type *ty = current_fn->ty->return_ty;
+cc/parse.c:1563:      exp = new_cast(exp, current_fn->ty->return_ty);
+cc/parse.c:1871:  case ND_SHL:
+cc/parse.c:1873:  case ND_SHR:
+cc/parse.c:1964:  case ND_SHL:
+cc/parse.c:1965:  case ND_SHR:
+cc/parse.c:2156:    return to_assign(new_add(node, assign(rest, tok->next), tok));
+cc/parse.c:2159:    return to_assign(new_sub(node, assign(rest, tok->next), tok));
+cc/parse.c:2354:static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
+cc/parse.c:2384:static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
+cc/parse.c:2428:      node = new_add(node, mul(&tok, tok->next), start);
+cc/parse.c:2433:      node = new_sub(node, mul(&tok, tok->next), start);
+cc/parse.c:2528:    return to_assign(new_add(unary(rest, tok->next), new_num(1, tok), tok));
+cc/parse.c:2532:    return to_assign(new_sub(unary(rest, tok->next), new_num(1, tok), tok));
+cc/parse.c:2796:  return new_cast(new_add(to_assign(new_add(node, new_num(addend, tok), tok)),
+cc/parse.c:2834:      node = funcall(&tok, tok->next, node);
+cc/parse.c:2843:      node = new_unary(ND_DEREF, new_add(node, idx, start), start);
+cc/parse.c:2879:static Node *funcall(Token **rest, Token *tok, Node *fn) {
+cc/parse.c:2899:    if (!param_ty && !ty->is_variadic)
+cc/parse.c:2922:  node->ty = ty->return_ty;
+cc/parse.c:3239:  Type *rty = ty->return_ty;
+cc/parse.c:3243:  fn->params = locals;
+cc/parse.c:3245:  if (ty->is_variadic)
+cc/parse.c:3335:  ty->params = copy_type(ty_int);
+  3030	    *rest = skip(tok, ")");
+  3031	    return new_ulong(ty->align, tok);
+  3032	  }
+  3033	
+  3034	  if (equal(tok, "_Alignof")) {
+  3035	    Node *node = unary(rest, tok->next);
+  3036	    add_type(node);
+  3037	    return new_ulong(node->ty->align, tok);
+  3038	  }
+  3039	
+  3040	  if (equal(tok, "_Generic"))
+  3041	    return generic_selection(rest, tok->next);
+  3042	
+  3043	  if (equal(tok, "__builtin_types_compatible_p")) {
+  3044	    tok = skip(tok->next, "(");
+  3045	    Type *t1 = typename(&tok, tok);
+  3046	    tok = skip(tok, ",");
+  3047	    Type *t2 = typename(&tok, tok);
+  3048	    *rest = skip(tok, ")");
+  3049	    return new_num(is_compatible(t1, t2), start);
+  3050	  }
+  3051	
+  3052	  if (equal(tok, "__builtin_reg_class")) {
+  3053	    tok = skip(tok->next, "(");
+  3054	    Type *ty = typename(&tok, tok);
+  3055	    *rest = skip(tok, ")");
+  3056	
+  3057	    if (is_integer(ty) || ty->kind == TY_PTR)
+  3058	      return new_num(0, start);
+  3059	    if (is_flonum(ty))
+  3060	      return new_num(1, start);
+  3061	    return new_num(2, start);
+  3062	  }
+  3063	
+  3064	  if (equal(tok, "__builtin_compare_and_swap")) {
+  3065	    Node *node = new_node(ND_CAS, tok);
+  3066	    tok = skip(tok->next, "(");
+  3067	    node->cas_addr = assign(&tok, tok);
+  3068	    tok = skip(tok, ",");
+  3069	    node->cas_old = assign(&tok, tok);
+  3070	    tok = skip(tok, ",");
+  3071	    node->cas_new = assign(&tok, tok);
+  3072	    *rest = skip(tok, ")");
+  3073	    return node;
+  3074	  }
+  3075	
+  3076	  if (equal(tok, "__builtin_atomic_exchange")) {
+  3077	    Node *node = new_node(ND_EXCH, tok);
+  3078	    tok = skip(tok->next, "(");
+  3079	    node->lhs = assign(&tok, tok);
+  3080	    tok = skip(tok, ",");
+  3081	    node->rhs = assign(&tok, tok);
+  3082	    *rest = skip(tok, ")");
+  3083	    return node;
+  3084	  }
+  3085	
+  3086	  if (tok->kind == TK_IDENT) {
+  3087	    // Variable or enum constant
+  3088	    VarScope *sc = find_var(tok);
+  3089	    *rest = tok->next;
+  3090	
+  3091	    // For "static inline" function
+  3092	    if (sc && sc->var && sc->var->is_function) {
+  3093	      if (current_fn)
+  3094	        strarray_push(&current_fn->refs, sc->var->name);
+  3095	      else
+  3096	        sc->var->is_root = true;
+  3097	    }
+  3098	
+  3099	    if (sc) {
+  3100	      if (sc->var)
+  3101	        return new_var_node(sc->var, tok);
+  3102	      if (sc->enum_ty)
+  3103	        return new_num(sc->enum_val, tok);
+  3104	    }
+  3105	
+  3106	    if (equal(tok->next, "("))
+  3107	      error_tok(tok, "implicit declaration of a function");
+  3108	    error_tok(tok, "undefined variable");
+  3109	  }
+  3110	
+  3111	  if (tok->kind == TK_STR) {
+  3112	    Obj *var = new_string_literal(tok->str, tok->ty);
+  3113	    *rest = tok->next;
+  3114	    return new_var_node(var, tok);
+  3115	  }
+  3116	
+  3117	  if (tok->kind == TK_NUM) {
+  3118	    Node *node;
+  3119	    if (is_flonum(tok->ty)) {
+  3120	      node = new_node(ND_NUM, tok);
+  3121	      node->fval = tok->fval;
+  3122	    } else {
+  3123	      node = new_num(tok->val, tok);
+  3124	    }
+  3125	
+  3126	    node->ty = tok->ty;
+  3127	    *rest = tok->next;
+  3128	    return node;
+  3129	  }
+  3130	
+  3131	  error_tok(tok, "expected an expression");
+  3132	}
+  3133	
+  3134	static Token *parse_typedef(Token *tok, Type *basety) {
+  3135	  bool first = true;
+  3136	
+  3137	  while (!consume(&tok, tok, ";")) {
+  3138	    if (!first)
+  3139	      tok = skip(tok, ",");
+  3140	    first = false;
+  3141	
+  3142	    Type *ty = declarator(&tok, tok, basety);
+  3143	    if (!ty->name)
+  3144	      error_tok(ty->name_pos, "typedef name omitted");
+  3145	    push_scope(get_ident(ty->name))->type_def = ty;
+  3146	  }
+  3147	  return tok;
+  3148	}
+  3149	
+  3150	static void create_param_lvars(Type *param) {
+  3151	  if (param) {
+  3152	    create_param_lvars(param->next);
+  3153	    if (!param->name)
+  3154	      error_tok(param->name_pos, "parameter name omitted");
+  3155	    new_lvar(get_ident(param->name), param);
+  3156	  }
+  3157	}
+  3158	
+  3159	// This function matches gotos or labels-as-values with labels.
+  3160	//
+  3161	// We cannot resolve gotos as we parse a function because gotos
+  3162	// can refer a label that appears later in the function.
+  3163	// So, we need to do this after we parse the entire function.
+  3164	static void resolve_goto_labels(void) {
+  3165	  for (Node *x = gotos; x; x = x->goto_next) {
+  3166	    for (Node *y = labels; y; y = y->goto_next) {
+  3167	      if (!strcmp(x->label, y->label)) {
+  3168	        x->unique_label = y->unique_label;
+  3169	        break;
+  3170	      }
+  3171	    }
+  3172	
+  3173	    if (x->unique_label == NULL)
+  3174	      error_tok(x->tok->next, "use of undeclared label");
+  3175	  }
+  3176	
+  3177	  gotos = labels = NULL;
+  3178	}
+  3179	
+  3180	static Obj *find_func(char *name) {
+  3181	  Scope *sc = scope;
+  3182	  while (sc->next)
+  3183	    sc = sc->next;
+  3184	
+  3185	  VarScope *sc2 = hashmap_get(&sc->vars, name);
+  3186	  if (sc2 && sc2->var && sc2->var->is_function)
+  3187	    return sc2->var;
+  3188	  return NULL;
+  3189	}
+  3190	
+  3191	static void mark_live(Obj *var) {
+  3192	  if (!var->is_function || var->is_live)
+  3193	    return;
+  3194	  var->is_live = true;
+  3195	
+  3196	  for (int i = 0; i < var->refs.len; i++) {
+  3197	    Obj *fn = find_func(var->refs.data[i]);
+  3198	    if (fn)
+  3199	      mark_live(fn);
+  3200	  }
+  3201	}
+  3202	
+  3203	static Token *function(Token *tok, Type *basety, VarAttr *attr) {
+  3204	  Type *ty = declarator(&tok, tok, basety);
+  3205	  if (!ty->name)
+  3206	    error_tok(ty->name_pos, "function name omitted");
+  3207	  char *name_str = get_ident(ty->name);
+  3208	
+  3209	  Obj *fn = find_func(name_str);
+  3210	  if (fn) {
+  3211	    // Redeclaration
+  3212	    if (!fn->is_function)
+  3213	      error_tok(tok, "redeclared as a different kind of symbol");
+  3214	    if (fn->is_definition && equal(tok, "{"))
+  3215	      error_tok(tok, "redefinition of %s", name_str);
+  3216	    if (!fn->is_static && attr->is_static)
+  3217	      error_tok(tok, "static declaration follows a non-static declaration");
+  3218	    fn->is_definition = fn->is_definition || equal(tok, "{");
+  3219	  } else {
+  3220	    fn = new_gvar(name_str, ty);
+  3221	    fn->is_function = true;
+  3222	    fn->is_definition = equal(tok, "{");
+  3223	    fn->is_static = attr->is_static || (attr->is_inline && !attr->is_extern);
+  3224	    fn->is_inline = attr->is_inline;
+  3225	  }
+  3226	
+  3227	  fn->is_root = !(fn->is_static && fn->is_inline);
+  3228	
+  3229	  if (consume(&tok, tok, ";"))
+  3230	    return tok;
+  3231	
+  3232	  current_fn = fn;
+  3233	  locals = NULL;
+  3234	  enter_scope();
+  3235	  create_param_lvars(ty->params);
+  3236	
+  3237	  // A buffer for a struct/union return value is passed
+  3238	  // as the hidden first parameter.
+  3239	  Type *rty = ty->return_ty;
+  3240	  if (rty->kind == TY_STRUCT || rty->kind == TY_UNION)
+  3241	    new_lvar("", pointer_to(rty));
+  3242	
+  3243	  fn->params = locals;
+  3244	
+  3245	  if (ty->is_variadic)
+  3246	    fn->va_area = new_lvar("__va_area__", pointer_to(ty_char));
+  3247	  fn->alloca_bottom = new_lvar("__alloca_size__", pointer_to(ty_char));
+  3248	
+  3249	  tok = skip(tok, "{");
+  3250	
+  3251	  // [https://www.sigbus.info/n1570#6.4.2.2p1] "__func__" is
+  3252	  // automatically defined as a local variable containing the
+  3253	  // current function name.
+  3254	  push_scope("__func__")->var =
+  3255	    new_string_literal(fn->name, array_of(ty_char, strlen(fn->name) + 1));
+  3256	
+  3257	  // [GNU] __FUNCTION__ is yet another name of __func__.
+  3258	  push_scope("__FUNCTION__")->var =
+  3259	    new_string_literal(fn->name, array_of(ty_char, strlen(fn->name) + 1));
+  3260	
+  2360	    return new_binary(ND_ADD, lhs, rhs, tok);
+  2361	
+  2362	  if (lhs->ty->base && rhs->ty->base)
+  2363	    error_tok(tok, "invalid operands");
+  2364	
+  2365	  // Canonicalize `num + ptr` to `ptr + num`.
+  2366	  if (!lhs->ty->base && rhs->ty->base) {
+  2367	    Node *tmp = lhs;
+  2368	    lhs = rhs;
+  2369	    rhs = tmp;
+  2370	  }
+  2371	
+  2372	  // VLA + num
+  2373	  if (lhs->ty->base->kind == TY_VLA) {
+  2374	    rhs = new_binary(ND_MUL, rhs, new_var_node(lhs->ty->base->vla_size, tok), tok);
+  2375	    return new_binary(ND_ADD, lhs, rhs, tok);
+  2376	  }
+  2377	
+  2378	  // ptr + num
+  2379	  rhs = new_binary(ND_MUL, rhs, new_long(lhs->ty->base->size, tok), tok);
+  2380	  return new_binary(ND_ADD, lhs, rhs, tok);
+  2381	}
+  2382	
+  2383	// Like `+`, `-` is overloaded for the pointer type.
+  2384	static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
+  2385	  add_type(lhs);
+  2386	  add_type(rhs);
+  2387	
+  2388	  // num - num
+  2389	  if (is_numeric(lhs->ty) && is_numeric(rhs->ty))
+  2390	    return new_binary(ND_SUB, lhs, rhs, tok);
+  2391	
+  2392	  // VLA + num
+  2393	  if (lhs->ty->base->kind == TY_VLA) {
+  2394	    rhs = new_binary(ND_MUL, rhs, new_var_node(lhs->ty->base->vla_size, tok), tok);
+  2395	    add_type(rhs);
+  2396	    Node *node = new_binary(ND_SUB, lhs, rhs, tok);
+  2397	    node->ty = lhs->ty;
+  2398	    return node;
+  2399	  }
+  2400	
+  2401	  // ptr - num
+  2402	  if (lhs->ty->base && is_integer(rhs->ty)) {
+  2403	    rhs = new_binary(ND_MUL, rhs, new_long(lhs->ty->base->size, tok), tok);
+  2404	    add_type(rhs);
+  2405	    Node *node = new_binary(ND_SUB, lhs, rhs, tok);
+  2406	    node->ty = lhs->ty;
+  2407	    return node;
+  2408	  }
+  2409	
+  2410	  // ptr - ptr, which returns how many elements are between the two.
+  2411	  if (lhs->ty->base && rhs->ty->base) {
+  2412	    Node *node = new_binary(ND_SUB, lhs, rhs, tok);
+  2413	    node->ty = ty_long;
+  2414	    return new_binary(ND_DIV, node, new_num(lhs->ty->base->size, tok), tok);
+  2415	  }
+  2416	
+  2417	  error_tok(tok, "invalid operands");
+  2418	}
+  2419	
+  2420	// add = mul ("+" mul | "-" mul)*
+  2421	static Node *add(Token **rest, Token *tok) {
+  2422	  Node *node = mul(&tok, tok);
+  2423	
+  2424	  for (;;) {
+  2425	    Token *start = tok;
+  2426	
+  2427	    if (equal(tok, "+")) {
+  2428	      node = new_add(node, mul(&tok, tok->next), start);
+  2429	      continue;
+  2430	    }
+  2431	
+  2432	    if (equal(tok, "-")) {
+  2433	      node = new_sub(node, mul(&tok, tok->next), start);
+  2434	      continue;
+  2435	    }
+  2436	
+  2437	    *rest = tok;
+  2438	    return node;
+  2439	  }
+  2440	}
+  2441	
+  2442	// mul = cast ("*" cast | "/" cast | "%" cast)*
+  2443	static Node *mul(Token **rest, Token *tok) {
+  2444	  Node *node = cast(&tok, tok);
+  2445	
+  2446	  for (;;) {
+  2447	    Token *start = tok;
+  2448	
+  2449	    if (equal(tok, "*")) {
+  2450	      node = new_binary(ND_MUL, node, cast(&tok, tok->next), start);
+  2451	      continue;
+  2452	    }
+  2453	
+  2454	    if (equal(tok, "/")) {
+  2455	      node = new_binary(ND_DIV, node, cast(&tok, tok->next), start);
+  2456	      continue;
+  2457	    }
+  2458	
+  2459	    if (equal(tok, "%")) {
+  2460	      node = new_binary(ND_MOD, node, cast(&tok, tok->next), start);
+  2461	      continue;
+  2462	    }
+  2463	
+  2464	    *rest = tok;
+  2465	    return node;
+  2466	  }
+  2467	}
+  2468	
+  2469	// cast = "(" type-name ")" cast | unary
+  2470	static Node *cast(Token **rest, Token *tok) {
+  2471	  if (equal(tok, "(") && is_typename(tok->next)) {
+  2472	    Token *start = tok;
+  2473	    Type *ty = typename(&tok, tok->next);
+  2474	    tok = skip(tok, ")");
+  2475	
+  2476	    // compound literal
+  2477	    if (equal(tok, "{"))
+  2478	      return unary(rest, start);
+  2479	
+  2480	    // type cast
+  2481	    Node *node = new_cast(cast(rest, tok), ty);
+  2482	    node->tok = start;
+  2483	    return node;
+  2484	  }
+  2485	
+  2486	  return unary(rest, tok);
+  2487	}
+  2488	
+  2489	// unary = ("+" | "-" | "*" | "&" | "!" | "~") cast
+  2490	//       | ("++" | "--") unary
+   560	      break;
+   561	    case FLOAT:
+   562	      ty = ty_float;
+   563	      break;
+   564	    case DOUBLE:
+   565	      ty = ty_double;
+   566	      break;
+   567	    case LONG + DOUBLE:
+   568	      ty = ty_ldouble;
+   569	      break;
+   570	    default:
+   571	      error_tok(tok, "invalid type");
+   572	    }
+   573	
+   574	    tok = tok->next;
+   575	  }
+   576	
+   577	  if (is_atomic) {
+   578	    ty = copy_type(ty);
+   579	    ty->is_atomic = true;
+   580	  }
+   581	
+   582	  *rest = tok;
+   583	  return ty;
+   584	}
+   585	
+   586	// func-params = ("void" | param ("," param)* ("," "...")?)? ")"
+   587	// param       = declspec declarator
+   588	static Type *func_params(Token **rest, Token *tok, Type *ty) {
+   589	  if (equal(tok, "void") && equal(tok->next, ")")) {
+   590	    *rest = tok->next->next;
+   591	    return func_type(ty);
+   592	  }
+   593	
+   594	  Type head = {};
+   595	  Type *cur = &head;
+   596	  bool is_variadic = false;
+   597	
+   598	  while (!equal(tok, ")")) {
+   599	    if (cur != &head)
+   600	      tok = skip(tok, ",");
+   601	
+   602	    if (equal(tok, "...")) {
+   603	      is_variadic = true;
+   604	      tok = tok->next;
+   605	      skip(tok, ")");
+   606	      break;
+   607	    }
+   608	
+   609	    Type *ty2 = declspec(&tok, tok, NULL);
+   610	    ty2 = declarator(&tok, tok, ty2);
+   611	
+   612	    Token *name = ty2->name;
+   613	
+   614	    if (ty2->kind == TY_ARRAY) {
+   615	      // "array of T" is converted to "pointer to T" only in the parameter
+   616	      // context. For example, *argv[] is converted to **argv by this.
+   617	      ty2 = pointer_to(ty2->base);
+   618	      ty2->name = name;
+   619	    } else if (ty2->kind == TY_FUNC) {
+   620	      // Likewise, a function is converted to a pointer to a function
+   621	      // only in the parameter context.
+   622	      ty2 = pointer_to(ty2);
+   623	      ty2->name = name;
+   624	    }
+   625	
+   626	    cur = cur->next = copy_type(ty2);
+   627	  }
+   628	
+   629	  if (cur == &head)
+   630	    is_variadic = true;
+   631	
+   632	  ty = func_type(ty);
+   633	  ty->params = head.next;
+   634	  ty->is_variadic = is_variadic;
+   635	  *rest = tok->next;
+   636	  return ty;
+   637	}
+   638	
+   639	// array-dimensions = ("static" | "restrict")* const-expr? "]" type-suffix
+   640	static Type *array_dimensions(Token **rest, Token *tok, Type *ty) {
+   641	  while (equal(tok, "static") || equal(tok, "restrict"))
+   642	    tok = tok->next;
+   643	
+   644	  if (equal(tok, "]")) {
+   645	    ty = type_suffix(rest, tok->next, ty);
+   646	    return array_of(ty, -1);
+   647	  }
+   648	
+   649	  Node *expr = conditional(&tok, tok);
+   650	  tok = skip(tok, "]");
+   651	  ty = type_suffix(rest, tok, ty);
+   652	
+   653	  if (ty->kind == TY_VLA || !is_const_expr(expr))
+   654	    return vla_of(ty, expr);
+   655	  return array_of(ty, eval(expr));
+   656	}
+   657	
+   658	// type-suffix = "(" func-params
+   659	//             | "[" array-dimensions
+   660	//             | ε
+   661	static Type *type_suffix(Token **rest, Token *tok, Type *ty) {
+   662	  if (equal(tok, "("))
+   663	    return func_params(rest, tok->next, ty);
+   664	
+   665	  if (equal(tok, "["))
+   666	    return array_dimensions(rest, tok->next, ty);
+   667	
+   668	  *rest = tok;
+   669	  return ty;
+   670	}
+   671	
+   672	// pointers = ("*" ("const" | "volatile" | "restrict")*)*
+   673	static Type *pointers(Token **rest, Token *tok, Type *ty) {
+   674	  while (consume(&tok, tok, "*")) {
+   675	    ty = pointer_to(ty);
+   676	    while (equal(tok, "const") || equal(tok, "volatile") || equal(tok, "restrict") ||
+   677	           equal(tok, "__restrict") || equal(tok, "__restrict__"))
+   678	      tok = tok->next;
+   679	  }
+   680	  *rest = tok;
+   681	  return ty;
+   682	}
+   683	
+   684	// declarator = pointers ("(" ident ")" | "(" declarator ")" | ident) type-suffix
+   685	static Type *declarator(Token **rest, Token *tok, Type *ty) {
+   686	  ty = pointers(&tok, tok, ty);
+   687	
+   688	  if (equal(tok, "(")) {
+   689	    Token *start = tok;
+   690	    Type dummy = {};
+   691	    declarator(&tok, start->next, &dummy);
+   692	    tok = skip(tok, ")");
+   693	    ty = type_suffix(rest, tok, ty);
+   694	    return declarator(&tok, start->next, ty);
+   695	  }
+   696	
+   697	  Token *name = NULL;
+   698	  Token *name_pos = tok;
+   699	
+   700	  if (tok->kind == TK_IDENT) {
+
+exec
+/bin/bash -lc "nl -ba cc/parse.c | sed -n '2870,2940p'; nl -ba cc/parse.c | sed -n '1535,1580p'; rg -n \"is_atomic|is_tls|is_bitfield|TY_VLA|ND_STMT_EXPR|ND_ASM|attribute|packed|aligned\" cc/parse.c | head -160" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+  2870	      continue;
+  2871	    }
+  2872	
+  2873	    *rest = tok;
+  2874	    return node;
+  2875	  }
+  2876	}
+  2877	
+  2878	// funcall = (assign ("," assign)*)? ")"
+  2879	static Node *funcall(Token **rest, Token *tok, Node *fn) {
+  2880	  add_type(fn);
+  2881	
+  2882	  if (fn->ty->kind != TY_FUNC &&
+  2883	      (fn->ty->kind != TY_PTR || fn->ty->base->kind != TY_FUNC))
+  2884	    error_tok(fn->tok, "not a function");
+  2885	
+  2886	  Type *ty = (fn->ty->kind == TY_FUNC) ? fn->ty : fn->ty->base;
+  2887	  Type *param_ty = ty->params;
+  2888	
+  2889	  Node head = {};
+  2890	  Node *cur = &head;
+  2891	
+  2892	  while (!equal(tok, ")")) {
+  2893	    if (cur != &head)
+  2894	      tok = skip(tok, ",");
+  2895	
+  2896	    Node *arg = assign(&tok, tok);
+  2897	    add_type(arg);
+  2898	
+  2899	    if (!param_ty && !ty->is_variadic)
+  2900	      error_tok(tok, "too many arguments");
+  2901	
+  2902	    if (param_ty) {
+  2903	      if (param_ty->kind != TY_STRUCT && param_ty->kind != TY_UNION)
+  2904	        arg = new_cast(arg, param_ty);
+  2905	      param_ty = param_ty->next;
+  2906	    } else if (arg->ty->kind == TY_FLOAT) {
+  2907	      // If parameter type is omitted (e.g. in "..."), float
+  2908	      // arguments are promoted to double.
+  2909	      arg = new_cast(arg, ty_double);
+  2910	    }
+  2911	
+  2912	    cur = cur->next = arg;
+  2913	  }
+  2914	
+  2915	  if (param_ty)
+  2916	    error_tok(tok, "too few arguments");
+  2917	
+  2918	  *rest = skip(tok, ")");
+  2919	
+  2920	  Node *node = new_unary(ND_FUNCALL, fn, tok);
+  2921	  node->func_ty = ty;
+  2922	  node->ty = ty->return_ty;
+  2923	  node->args = head.next;
+  2924	
+  2925	  // If a function returns a struct, it is caller's responsibility
+  2926	  // to allocate a space for the return value.
+  2927	  if (node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION)
+  2928	    node->ret_buffer = new_lvar("", node->ty);
+  2929	  return node;
+  2930	}
+  2931	
+  2932	// generic-selection = "(" assign "," generic-assoc ("," generic-assoc)* ")"
+  2933	//
+  2934	// generic-assoc = type-name ":" assign
+  2935	//               | "default" ":" assign
+  2936	static Node *generic_selection(Token **rest, Token *tok) {
+  2937	  Token *start = tok;
+  2938	  tok = skip(tok, "(");
+  2939	
+  2940	  Node *ctrl = assign(&tok, tok);
+  1535	
+  1536	// stmt = "return" expr? ";"
+  1537	//      | "if" "(" expr ")" stmt ("else" stmt)?
+  1538	//      | "switch" "(" expr ")" stmt
+  1539	//      | "case" const-expr ("..." const-expr)? ":" stmt
+  1540	//      | "default" ":" stmt
+  1541	//      | "for" "(" expr-stmt expr? ";" expr? ")" stmt
+  1542	//      | "while" "(" expr ")" stmt
+  1543	//      | "do" stmt "while" "(" expr ")" ";"
+  1544	//      | "asm" asm-stmt
+  1545	//      | "goto" (ident | "*" expr) ";"
+  1546	//      | "break" ";"
+  1547	//      | "continue" ";"
+  1548	//      | ident ":" stmt
+  1549	//      | "{" compound-stmt
+  1550	//      | expr-stmt
+  1551	static Node *stmt(Token **rest, Token *tok) {
+  1552	  if (equal(tok, "return")) {
+  1553	    Node *node = new_node(ND_RETURN, tok);
+  1554	    if (consume(rest, tok->next, ";"))
+  1555	      return node;
+  1556	
+  1557	    Node *exp = expr(&tok, tok->next);
+  1558	    *rest = skip(tok, ";");
+  1559	
+  1560	    add_type(exp);
+  1561	    Type *ty = current_fn->ty->return_ty;
+  1562	    if (ty->kind != TY_STRUCT && ty->kind != TY_UNION)
+  1563	      exp = new_cast(exp, current_fn->ty->return_ty);
+  1564	
+  1565	    node->lhs = exp;
+  1566	    return node;
+  1567	  }
+  1568	
+  1569	  if (equal(tok, "if")) {
+  1570	    Node *node = new_node(ND_IF, tok);
+  1571	    tok = skip(tok->next, "(");
+  1572	    node->cond = expr(&tok, tok);
+  1573	    tok = skip(tok, ")");
+  1574	    node->then = stmt(&tok, tok);
+  1575	    if (equal(tok, "else"))
+  1576	      node->els = stmt(&tok, tok->next);
+  1577	    *rest = tok;
+  1578	    return node;
+  1579	  }
+  1580	
+41:// Variable attributes such as typedef or extern.
+47:  bool is_tls;
+402:  bool is_atomic = false;
+420:        attr->is_tls = true;
+423:          attr->is_static + attr->is_extern + attr->is_inline + attr->is_tls > 1)
+443:      is_atomic = true;
+577:  if (is_atomic) {
+579:    ty->is_atomic = true;
+653:  if (ty->kind == TY_VLA || !is_const_expr(expr))
+822:  if (ty->kind != TY_VLA)
+826:  if (ty->base->kind == TY_VLA)
+877:    if (ty->kind == TY_VLA) {
+1431:      if (mem->is_bitfield) {
+1522:  Node *node = new_node(ND_ASM, tok);
+2075:  if (binary->lhs->ty->is_atomic) {
+2123:    Node *node = new_node(ND_STMT_EXPR, tok);
+2373:  if (lhs->ty->base->kind == TY_VLA) {
+2393:  if (lhs->ty->base->kind == TY_VLA) {
+2503:    if (lhs->kind == ND_MEMBER && lhs->member->is_bitfield)
+2582:        mem->is_bitfield = true;
+2602:// attribute = ("__attribute__" "(" "(" "packed" ")" ")")*
+2603:static Token *attribute_list(Token *tok, Type *ty) {
+2604:  while (consume(&tok, tok, "__attribute__")) {
+2615:      if (consume(&tok, tok, "packed")) {
+2616:        ty->is_packed = true;
+2620:      if (consume(&tok, tok, "aligned")) {
+2627:      error_tok(tok, "unknown attribute");
+2636:// struct-union-decl = attribute? ident? ("{" struct-members)?
+2639:  tok = attribute_list(tok, ty);
+2664:  *rest = attribute_list(tok, ty);
+2693:    if (mem->is_bitfield && mem->bit_width == 0) {
+2697:    } else if (mem->is_bitfield) {
+2706:      if (!ty->is_packed)
+2712:    if (!ty->is_packed && ty->align < mem->align)
+2992:    Node *node = new_node(ND_STMT_EXPR, tok);
+3008:    if (ty->kind == TY_VLA) {
+3023:    if (node->ty->kind == TY_VLA)
+3283:    var->is_tls = attr->is_tls;
+3289:    else if (!attr->is_extern && !attr->is_tls)
+
+codex
+The first pass has surfaced a few high-risk seams worth validating experimentally: prototype-less calls, variadic argument layout, large-index pointer arithmetic, and static relocation resolution. I’m now checking emitted modules and validator/runtime behavior with minimal probes where the build tooling permits it.
+exec
+/bin/bash -lc 'rg -n "''^cc|chibicc|wasm.*cc|CC_WASM|build/cc" Makefile **/Makefile 2>/dev/null | head -200; find build -maxdepth 3 -type f -perm -111 -o -name '"'*.wasm' 2>/dev/null | head -100; command -v wasm-validate || true; command -v wasmtime || true; command -v clang || true" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+Makefile:1:# Pipeline: guest/X.c --clang(untrusted)--> build/X.wasm --w2c2--> build/X/guest.c --tcc--> build/X/sandbox
+Makefile:58:# ---- Experiment 3: C -> wasm with the chibicc backend (no clang) ----
+Makefile:60:build/chibicc-wasm: $(CC_SRCS)
+Makefile:65:build/cc/%.c: guest/%.c libc/libc.c
+Makefile:66:	@mkdir -p build/cc
+Makefile:69:build/cc/%.wasm: build/cc/%.c build/chibicc-wasm libc/libc.h
+Makefile:70:	./build/chibicc-wasm -I. -Ilibc -Ilibc/include -mmaxpages=256 -o $@ $<
+Makefile:72:build/cc/%/guest.c: build/cc/%.wasm build/w2c2-native
+Makefile:73:	@mkdir -p build/cc/$*
+Makefile:74:	cp $< build/cc/$*/guest.wasm
+Makefile:75:	./build/w2c2-native build/cc/$*/guest.wasm $@
+Makefile:77:build/cc/%/sandbox: build/cc/%/guest.c host/main.c rt/w2c2_base.h
+Makefile:78:	$(TCC) -nostdlib -static -nostdinc -Irt -Ibuild/cc/$* -DARENA_PAGES=$(ARENA_PAGES) -o $@ host/main.c $<
+Makefile:80:build/cc/w2c2.c: $(W2C2_SRC) libc/libc.c libc/stdio.c
+Makefile:81:	@mkdir -p build/cc
+Makefile:84:build/cc/w2c2.wasm: build/cc/w2c2.c build/chibicc-wasm $(wildcard w2c2/*.h) $(wildcard libc/include/*.h)
+Makefile:85:	./build/chibicc-wasm -I. -Ilibc -Ilibc/include -Iw2c2 -DHAS_UNISTD=1 -DGUEST_ARGV='"w2c2","guest.wasm","guest.c"' -mstack=4194304 -mmaxpages=4096 -o $@ $<
+Makefile:87:exp3-guests: $(GUESTS:%=build/cc/%/sandbox)
+build/chibicc-wasm
+build/cat/guest.wasm
+build/cat/sandbox
+build/pf
+build/w2c2/guest.wasm
+build/w2c2/sandbox
+build/evil/guest.wasm
+build/evil/sandbox
+build/escape.wasm
+build/w2c2-native
+build/cmp/native-rot13/guest.wasm
+build/rot13/guest.wasm
+build/rot13/sandbox
+build/cat.wasm
+build/chibicc-wasm-tcc
+build/grow/guest.wasm
+build/grow/sandbox
+build/gen2/sandbox
+build/control
+build/w2c2.wasm
+build/rot13.wasm
+build/escape/sandbox-demo
+build/escape/guest.wasm
+build/escape/sandbox
+build/cc/cat/guest.wasm
+build/cc/cat/sandbox
+build/cc/evil/guest.wasm
+build/cc/evil/sandbox
+build/cc/escape.wasm
+build/cc/rot13/guest.wasm
+build/cc/rot13/sandbox
+build/cc/cat.wasm
+build/cc/grow/guest.wasm
+build/cc/grow/sandbox
+build/cc/w2c2.wasm
+build/cc/rot13.wasm
+build/cc/escape/guest.wasm
+build/cc/escape/sandbox
+build/cc/w2c2-tcc.wasm
+build/cc/evil.wasm
+build/cc/grow.wasm
+build/adv/mem_init_oob/guest.wasm
+build/adv/mem_init_oob/sandbox
+build/adv/elem_oob/guest.wasm
+build/adv/elem_oob/sandbox
+build/adv/oob_load/guest.wasm
+build/adv/oob_load/sandbox
+build/adv/positive/guest.wasm
+build/adv/positive/sandbox
+build/adv/callind_typemismatch/guest.wasm
+build/adv/callind_typemismatch/sandbox
+build/adv/elem_oob_max.wasm
+build/adv/oob_load.wasm
+build/adv/elem_oob.wasm
+build/adv/callind_typemismatch.wasm
+build/adv/mem_init_oob.wasm
+build/adv/positive.wasm
+build/adv/data_oob.wasm
+build/evil.wasm
+build/grow.wasm
+build/fix-cc/w2c2/guest.wasm
+build/fix-cc/gen2/sandbox
+build/fix-cc/sandbox
+build/tu/cat.wasm
+/bin/clang
+
+exec
+/bin/bash -lc "rg -n \"Relocation|write_gvar_data|write_buf|eval_rval\" cc/parse.c; nl -ba cc/parse.c | sed -n '1390,1470p'; nl -ba cc/parse.c | sed -n '1870,2015p'; nl -ba cc/chibicc.h | sed -n '90,180p'; nl -ba cc/chibicc.h | sed -n '250,350p'" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+129:static int64_t eval_rval(Node *node, char ***label);
+1407:static void write_buf(char *buf, uint64_t val, int sz) {
+1420:static Relocation *
+1421:write_gvar_data(Relocation *cur, Initializer *init, Type *ty, char *buf, int offset) {
+1425:      cur = write_gvar_data(cur, init->children[i], ty->base, buf, offset + sz * i);
+1441:        write_buf(loc, combined, mem->ty->size);
+1443:        cur = write_gvar_data(cur, init->children[mem->idx], mem->ty, buf,
+1453:    return write_gvar_data(cur, init->children[init->mem->idx],
+1474:    write_buf(buf + offset, val, ty->size);
+1478:  Relocation *rel = calloc(1, sizeof(Relocation));
+1493:  Relocation head = {};
+1495:  write_gvar_data(&head, init, var->ty, buf, 0);
+1913:    return eval_rval(node->lhs, label);
+1922:    return eval_rval(node->lhs, label) + node->member->offset;
+1937:static int64_t eval_rval(Node *node, char ***label) {
+1947:    return eval_rval(node->lhs, label) + node->member->offset;
+  1390	
+  1391	  Node *rhs = create_lvar_init(init, var->ty, &desg, tok);
+  1392	  return new_binary(ND_COMMA, lhs, rhs, tok);
+  1393	}
+  1394	
+  1395	static uint64_t read_buf(char *buf, int sz) {
+  1396	  if (sz == 1)
+  1397	    return *buf;
+  1398	  if (sz == 2)
+  1399	    return *(uint16_t *)buf;
+  1400	  if (sz == 4)
+  1401	    return *(uint32_t *)buf;
+  1402	  if (sz == 8)
+  1403	    return *(uint64_t *)buf;
+  1404	  unreachable();
+  1405	}
+  1406	
+  1407	static void write_buf(char *buf, uint64_t val, int sz) {
+  1408	  if (sz == 1)
+  1409	    *buf = val;
+  1410	  else if (sz == 2)
+  1411	    *(uint16_t *)buf = val;
+  1412	  else if (sz == 4)
+  1413	    *(uint32_t *)buf = val;
+  1414	  else if (sz == 8)
+  1415	    *(uint64_t *)buf = val;
+  1416	  else
+  1417	    unreachable();
+  1418	}
+  1419	
+  1420	static Relocation *
+  1421	write_gvar_data(Relocation *cur, Initializer *init, Type *ty, char *buf, int offset) {
+  1422	  if (ty->kind == TY_ARRAY) {
+  1423	    int sz = ty->base->size;
+  1424	    for (int i = 0; i < ty->array_len; i++)
+  1425	      cur = write_gvar_data(cur, init->children[i], ty->base, buf, offset + sz * i);
+  1426	    return cur;
+  1427	  }
+  1428	
+  1429	  if (ty->kind == TY_STRUCT) {
+  1430	    for (Member *mem = ty->members; mem; mem = mem->next) {
+  1431	      if (mem->is_bitfield) {
+  1432	        Node *expr = init->children[mem->idx]->expr;
+  1433	        if (!expr)
+  1434	          break;
+  1435	
+  1436	        char *loc = buf + offset + mem->offset;
+  1437	        uint64_t oldval = read_buf(loc, mem->ty->size);
+  1438	        uint64_t newval = eval(expr);
+  1439	        uint64_t mask = (1L << mem->bit_width) - 1;
+  1440	        uint64_t combined = oldval | ((newval & mask) << mem->bit_offset);
+  1441	        write_buf(loc, combined, mem->ty->size);
+  1442	      } else {
+  1443	        cur = write_gvar_data(cur, init->children[mem->idx], mem->ty, buf,
+  1444	                              offset + mem->offset);
+  1445	      }
+  1446	    }
+  1447	    return cur;
+  1448	  }
+  1449	
+  1450	  if (ty->kind == TY_UNION) {
+  1451	    if (!init->mem)
+  1452	      return cur;
+  1453	    return write_gvar_data(cur, init->children[init->mem->idx],
+  1454	                           init->mem->ty, buf, offset);
+  1455	  }
+  1456	
+  1457	  if (!init->expr)
+  1458	    return cur;
+  1459	
+  1460	  if (ty->kind == TY_FLOAT) {
+  1461	    *(float *)(buf + offset) = eval_double(init->expr);
+  1462	    return cur;
+  1463	  }
+  1464	
+  1465	  if (ty->kind == TY_DOUBLE) {
+  1466	    *(double *)(buf + offset) = eval_double(init->expr);
+  1467	    return cur;
+  1468	  }
+  1469	
+  1470	  char **label = NULL;
+  1870	    return eval(node->lhs) ^ eval(node->rhs);
+  1871	  case ND_SHL:
+  1872	    return eval(node->lhs) << eval(node->rhs);
+  1873	  case ND_SHR:
+  1874	    if (node->ty->is_unsigned && node->ty->size == 8)
+  1875	      return (uint64_t)eval(node->lhs) >> eval(node->rhs);
+  1876	    return eval(node->lhs) >> eval(node->rhs);
+  1877	  case ND_EQ:
+  1878	    return eval(node->lhs) == eval(node->rhs);
+  1879	  case ND_NE:
+  1880	    return eval(node->lhs) != eval(node->rhs);
+  1881	  case ND_LT:
+  1882	    if (node->lhs->ty->is_unsigned)
+  1883	      return (uint64_t)eval(node->lhs) < eval(node->rhs);
+  1884	    return eval(node->lhs) < eval(node->rhs);
+  1885	  case ND_LE:
+  1886	    if (node->lhs->ty->is_unsigned)
+  1887	      return (uint64_t)eval(node->lhs) <= eval(node->rhs);
+  1888	    return eval(node->lhs) <= eval(node->rhs);
+  1889	  case ND_COND:
+  1890	    return eval(node->cond) ? eval2(node->then, label) : eval2(node->els, label);
+  1891	  case ND_COMMA:
+  1892	    return eval2(node->rhs, label);
+  1893	  case ND_NOT:
+  1894	    return !eval(node->lhs);
+  1895	  case ND_BITNOT:
+  1896	    return ~eval(node->lhs);
+  1897	  case ND_LOGAND:
+  1898	    return eval(node->lhs) && eval(node->rhs);
+  1899	  case ND_LOGOR:
+  1900	    return eval(node->lhs) || eval(node->rhs);
+  1901	  case ND_CAST: {
+  1902	    int64_t val = eval2(node->lhs, label);
+  1903	    if (is_integer(node->ty)) {
+  1904	      switch (node->ty->size) {
+  1905	      case 1: return node->ty->is_unsigned ? (uint8_t)val : (int8_t)val;
+  1906	      case 2: return node->ty->is_unsigned ? (uint16_t)val : (int16_t)val;
+  1907	      case 4: return node->ty->is_unsigned ? (uint32_t)val : (int32_t)val;
+  1908	      }
+  1909	    }
+  1910	    return val;
+  1911	  }
+  1912	  case ND_ADDR:
+  1913	    return eval_rval(node->lhs, label);
+  1914	  case ND_LABEL_VAL:
+  1915	    *label = &node->unique_label;
+  1916	    return 0;
+  1917	  case ND_MEMBER:
+  1918	    if (!label)
+  1919	      error_tok(node->tok, "not a compile-time constant");
+  1920	    if (node->ty->kind != TY_ARRAY)
+  1921	      error_tok(node->tok, "invalid initializer");
+  1922	    return eval_rval(node->lhs, label) + node->member->offset;
+  1923	  case ND_VAR:
+  1924	    if (!label)
+  1925	      error_tok(node->tok, "not a compile-time constant");
+  1926	    if (node->var->ty->kind != TY_ARRAY && node->var->ty->kind != TY_FUNC)
+  1927	      error_tok(node->tok, "invalid initializer");
+  1928	    *label = &node->var->name;
+  1929	    return 0;
+  1930	  case ND_NUM:
+  1931	    return node->val;
+  1932	  }
+  1933	
+  1934	  error_tok(node->tok, "not a compile-time constant");
+  1935	}
+  1936	
+  1937	static int64_t eval_rval(Node *node, char ***label) {
+  1938	  switch (node->kind) {
+  1939	  case ND_VAR:
+  1940	    if (node->var->is_local)
+  1941	      error_tok(node->tok, "not a compile-time constant");
+  1942	    *label = &node->var->name;
+  1943	    return 0;
+  1944	  case ND_DEREF:
+  1945	    return eval2(node->lhs, label);
+  1946	  case ND_MEMBER:
+  1947	    return eval_rval(node->lhs, label) + node->member->offset;
+  1948	  }
+  1949	
+  1950	  error_tok(node->tok, "invalid initializer");
+  1951	}
+  1952	
+  1953	static bool is_const_expr(Node *node) {
+  1954	  add_type(node);
+  1955	
+  1956	  switch (node->kind) {
+  1957	  case ND_ADD:
+  1958	  case ND_SUB:
+  1959	  case ND_MUL:
+  1960	  case ND_DIV:
+  1961	  case ND_BITAND:
+  1962	  case ND_BITOR:
+  1963	  case ND_BITXOR:
+  1964	  case ND_SHL:
+  1965	  case ND_SHR:
+  1966	  case ND_EQ:
+  1967	  case ND_NE:
+  1968	  case ND_LT:
+  1969	  case ND_LE:
+  1970	  case ND_LOGAND:
+  1971	  case ND_LOGOR:
+  1972	    return is_const_expr(node->lhs) && is_const_expr(node->rhs);
+  1973	  case ND_COND:
+  1974	    if (!is_const_expr(node->cond))
+  1975	      return false;
+  1976	    return is_const_expr(eval(node->cond) ? node->then : node->els);
+  1977	  case ND_COMMA:
+  1978	    return is_const_expr(node->rhs);
+  1979	  case ND_NEG:
+  1980	  case ND_NOT:
+  1981	  case ND_BITNOT:
+  1982	  case ND_CAST:
+  1983	    return is_const_expr(node->lhs);
+  1984	  case ND_NUM:
+  1985	    return true;
+  1986	  }
+  1987	
+  1988	  return false;
+  1989	}
+  1990	
+  1991	int64_t const_expr(Token **rest, Token *tok) {
+  1992	  Node *node = conditional(rest, tok);
+  1993	  return eval(node);
+  1994	}
+  1995	
+  1996	static double eval_double(Node *node) {
+  1997	  add_type(node);
+  1998	
+  1999	  if (is_integer(node->ty)) {
+  2000	    if (node->ty->is_unsigned)
+  2001	      return (unsigned long)eval(node);
+  2002	    return eval(node);
+  2003	  }
+  2004	
+  2005	  switch (node->kind) {
+  2006	  case ND_ADD:
+  2007	    return eval_double(node->lhs) + eval_double(node->rhs);
+  2008	  case ND_SUB:
+  2009	    return eval_double(node->lhs) - eval_double(node->rhs);
+  2010	  case ND_MUL:
+  2011	    return eval_double(node->lhs) * eval_double(node->rhs);
+  2012	  case ND_DIV:
+  2013	    return eval_double(node->lhs) / eval_double(node->rhs);
+  2014	  case ND_NEG:
+  2015	    return -eval_double(node->lhs);
+    90	  Hideset *hideset; // For macro expansion
+    91	  Token *origin;    // If this is expanded from a macro, the original token
+    92	};
+    93	
+    94	noreturn void error(char *fmt, ...) __attribute__((format(printf, 1, 2)));
+    95	noreturn void error_at(char *loc, char *fmt, ...) __attribute__((format(printf, 2, 3)));
+    96	noreturn void error_tok(Token *tok, char *fmt, ...) __attribute__((format(printf, 2, 3)));
+    97	void warn_tok(Token *tok, char *fmt, ...) __attribute__((format(printf, 2, 3)));
+    98	bool equal(Token *tok, char *op);
+    99	Token *skip(Token *tok, char *op);
+   100	bool consume(Token **rest, Token *tok, char *str);
+   101	void convert_pp_tokens(Token *tok);
+   102	File **get_input_files(void);
+   103	File *new_file(char *name, int file_no, char *contents);
+   104	Token *tokenize_string_literal(Token *tok, Type *basety);
+   105	Token *tokenize(File *file);
+   106	Token *tokenize_file(char *filename);
+   107	
+   108	#define unreachable() \
+   109	  error("internal error at %s:%d", __FILE__, __LINE__)
+   110	
+   111	//
+   112	// preprocess.c
+   113	//
+   114	
+   115	char *search_include_paths(char *filename);
+   116	void init_macros(void);
+   117	void define_macro(char *name, char *buf);
+   118	void undef_macro(char *name);
+   119	Token *preprocess(Token *tok);
+   120	
+   121	//
+   122	// parse.c
+   123	//
+   124	
+   125	// Variable or function
+   126	typedef struct Obj Obj;
+   127	struct Obj {
+   128	  Obj *next;
+   129	  char *name;    // Variable name
+   130	  Type *ty;      // Type
+   131	  Token *tok;    // representative token
+   132	  bool is_local; // local or global/function
+   133	  int align;     // alignment
+   134	
+   135	  // Local variable
+   136	  int offset;
+   137	
+   138	  // Global variable or function
+   139	  bool is_function;
+   140	  bool is_definition;
+   141	  bool is_static;
+   142	
+   143	  // Global variable
+   144	  bool is_tentative;
+   145	  bool is_tls;
+   146	  char *init_data;
+   147	  Relocation *rel;
+   148	
+   149	  // Function
+   150	  bool is_inline;
+   151	  Obj *params;
+   152	  Node *body;
+   153	  Obj *locals;
+   154	  Obj *va_area;
+   155	  Obj *alloca_bottom;
+   156	  int stack_size;
+   157	
+   158	  // Static inline function
+   159	  bool is_live;
+   160	  bool is_root;
+   161	  StringArray refs;
+   162	};
+   163	
+   164	// Global variable can be initialized either by a constant expression
+   165	// or a pointer to another global variable. This struct represents the
+   166	// latter.
+   167	typedef struct Relocation Relocation;
+   168	struct Relocation {
+   169	  Relocation *next;
+   170	  int offset;
+   171	  char **label;
+   172	  long addend;
+   173	};
+   174	
+   175	// AST node
+   176	typedef enum {
+   177	  ND_NULL_EXPR, // Do nothing
+   178	  ND_ADD,       // +
+   179	  ND_SUB,       // -
+   180	  ND_MUL,       // *
+   250	
+   251	  // Struct member access
+   252	  Member *member;
+   253	
+   254	  // Function call
+   255	  Type *func_ty;
+   256	  Node *args;
+   257	  bool pass_by_stack;
+   258	  Obj *ret_buffer;
+   259	
+   260	  // Goto or labeled statement, or labels-as-values
+   261	  char *label;
+   262	  char *unique_label;
+   263	  Node *goto_next;
+   264	
+   265	  // Switch
+   266	  Node *case_next;
+   267	  Node *default_case;
+   268	
+   269	  // Case
+   270	  long begin;
+   271	  long end;
+   272	
+   273	  // "asm" string literal
+   274	  char *asm_str;
+   275	
+   276	  // Atomic compare-and-swap
+   277	  Node *cas_addr;
+   278	  Node *cas_old;
+   279	  Node *cas_new;
+   280	
+   281	  // Atomic op= operators
+   282	  Obj *atomic_addr;
+   283	  Node *atomic_expr;
+   284	
+   285	  // Variable
+   286	  Obj *var;
+   287	
+   288	  // Numeric literal
+   289	  int64_t val;
+   290	  long double fval;
+   291	};
+   292	
+   293	Node *new_cast(Node *expr, Type *ty);
+   294	int64_t const_expr(Token **rest, Token *tok);
+   295	Obj *parse(Token *tok);
+   296	
+   297	//
+   298	// type.c
+   299	//
+   300	
+   301	typedef enum {
+   302	  TY_VOID,
+   303	  TY_BOOL,
+   304	  TY_CHAR,
+   305	  TY_SHORT,
+   306	  TY_INT,
+   307	  TY_LONG,
+   308	  TY_FLOAT,
+   309	  TY_DOUBLE,
+   310	  TY_LDOUBLE,
+   311	  TY_ENUM,
+   312	  TY_PTR,
+   313	  TY_FUNC,
+   314	  TY_ARRAY,
+   315	  TY_VLA, // variable-length array
+   316	  TY_STRUCT,
+   317	  TY_UNION,
+   318	} TypeKind;
+   319	
+   320	struct Type {
+   321	  TypeKind kind;
+   322	  int size;           // sizeof() value
+   323	  int align;          // alignment
+   324	  bool is_unsigned;   // unsigned or signed
+   325	  bool is_atomic;     // true if _Atomic
+   326	  Type *origin;       // for type compatibility check
+   327	
+   328	  // Pointer-to or array-of type. We intentionally use the same member
+   329	  // to represent pointer/array duality in C.
+   330	  //
+   331	  // In many contexts in which a pointer is expected, we examine this
+   332	  // member instead of "kind" member to determine whether a type is a
+   333	  // pointer or not. That means in many contexts "array of T" is
+   334	  // naturally handled as if it were "pointer to T", as required by
+   335	  // the C spec.
+   336	  Type *base;
+   337	
+   338	  // Declaration
+   339	  Token *name;
+   340	  Token *name_pos;
+   341	
+   342	  // Array
+   343	  int array_len;
+   344	
+   345	  // Variable-length array
+   346	  Node *vla_len; // # of elements
+   347	  Obj *vla_size; // sizeof() value
+   348	
+   349	  // Struct
+   350	  Member *members;
+
+exec
+/bin/bash -lc "nl -ba cc/parse.c | sed -n '1580,1715p'; nl -ba cc/parse.c | sed -n '1460,1505p'; nl -ba cc/parse.c | sed -n '1990,2045p'; rg -n \"case_next|begin =|end =\" cc/parse.c" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+  1580	
+  1581	  if (equal(tok, "switch")) {
+  1582	    Node *node = new_node(ND_SWITCH, tok);
+  1583	    tok = skip(tok->next, "(");
+  1584	    node->cond = expr(&tok, tok);
+  1585	    tok = skip(tok, ")");
+  1586	
+  1587	    Node *sw = current_switch;
+  1588	    current_switch = node;
+  1589	
+  1590	    char *brk = brk_label;
+  1591	    brk_label = node->brk_label = new_unique_name();
+  1592	
+  1593	    node->then = stmt(rest, tok);
+  1594	
+  1595	    current_switch = sw;
+  1596	    brk_label = brk;
+  1597	    return node;
+  1598	  }
+  1599	
+  1600	  if (equal(tok, "case")) {
+  1601	    if (!current_switch)
+  1602	      error_tok(tok, "stray case");
+  1603	
+  1604	    Node *node = new_node(ND_CASE, tok);
+  1605	    int begin = const_expr(&tok, tok->next);
+  1606	    int end;
+  1607	
+  1608	    if (equal(tok, "...")) {
+  1609	      // [GNU] Case ranges, e.g. "case 1 ... 5:"
+  1610	      end = const_expr(&tok, tok->next);
+  1611	      if (end < begin)
+  1612	        error_tok(tok, "empty case range specified");
+  1613	    } else {
+  1614	      end = begin;
+  1615	    }
+  1616	
+  1617	    tok = skip(tok, ":");
+  1618	    node->label = new_unique_name();
+  1619	    node->lhs = stmt(rest, tok);
+  1620	    node->begin = begin;
+  1621	    node->end = end;
+  1622	    node->case_next = current_switch->case_next;
+  1623	    current_switch->case_next = node;
+  1624	    return node;
+  1625	  }
+  1626	
+  1627	  if (equal(tok, "default")) {
+  1628	    if (!current_switch)
+  1629	      error_tok(tok, "stray default");
+  1630	
+  1631	    Node *node = new_node(ND_CASE, tok);
+  1632	    tok = skip(tok->next, ":");
+  1633	    node->label = new_unique_name();
+  1634	    node->lhs = stmt(rest, tok);
+  1635	    current_switch->default_case = node;
+  1636	    return node;
+  1637	  }
+  1638	
+  1639	  if (equal(tok, "for")) {
+  1640	    Node *node = new_node(ND_FOR, tok);
+  1641	    tok = skip(tok->next, "(");
+  1642	
+  1643	    enter_scope();
+  1644	
+  1645	    char *brk = brk_label;
+  1646	    char *cont = cont_label;
+  1647	    brk_label = node->brk_label = new_unique_name();
+  1648	    cont_label = node->cont_label = new_unique_name();
+  1649	
+  1650	    if (is_typename(tok)) {
+  1651	      Type *basety = declspec(&tok, tok, NULL);
+  1652	      node->init = declaration(&tok, tok, basety, NULL);
+  1653	    } else {
+  1654	      node->init = expr_stmt(&tok, tok);
+  1655	    }
+  1656	
+  1657	    if (!equal(tok, ";"))
+  1658	      node->cond = expr(&tok, tok);
+  1659	    tok = skip(tok, ";");
+  1660	
+  1661	    if (!equal(tok, ")"))
+  1662	      node->inc = expr(&tok, tok);
+  1663	    tok = skip(tok, ")");
+  1664	
+  1665	    node->then = stmt(rest, tok);
+  1666	
+  1667	    leave_scope();
+  1668	    brk_label = brk;
+  1669	    cont_label = cont;
+  1670	    return node;
+  1671	  }
+  1672	
+  1673	  if (equal(tok, "while")) {
+  1674	    Node *node = new_node(ND_FOR, tok);
+  1675	    tok = skip(tok->next, "(");
+  1676	    node->cond = expr(&tok, tok);
+  1677	    tok = skip(tok, ")");
+  1678	
+  1679	    char *brk = brk_label;
+  1680	    char *cont = cont_label;
+  1681	    brk_label = node->brk_label = new_unique_name();
+  1682	    cont_label = node->cont_label = new_unique_name();
+  1683	
+  1684	    node->then = stmt(rest, tok);
+  1685	
+  1686	    brk_label = brk;
+  1687	    cont_label = cont;
+  1688	    return node;
+  1689	  }
+  1690	
+  1691	  if (equal(tok, "do")) {
+  1692	    Node *node = new_node(ND_DO, tok);
+  1693	
+  1694	    char *brk = brk_label;
+  1695	    char *cont = cont_label;
+  1696	    brk_label = node->brk_label = new_unique_name();
+  1697	    cont_label = node->cont_label = new_unique_name();
+  1698	
+  1699	    node->then = stmt(&tok, tok->next);
+  1700	
+  1701	    brk_label = brk;
+  1702	    cont_label = cont;
+  1703	
+  1704	    tok = skip(tok, "while");
+  1705	    tok = skip(tok, "(");
+  1706	    node->cond = expr(&tok, tok);
+  1707	    tok = skip(tok, ")");
+  1708	    *rest = skip(tok, ";");
+  1709	    return node;
+  1710	  }
+  1711	
+  1712	  if (equal(tok, "asm"))
+  1713	    return asm_stmt(rest, tok);
+  1714	
+  1715	  if (equal(tok, "goto")) {
+  1460	  if (ty->kind == TY_FLOAT) {
+  1461	    *(float *)(buf + offset) = eval_double(init->expr);
+  1462	    return cur;
+  1463	  }
+  1464	
+  1465	  if (ty->kind == TY_DOUBLE) {
+  1466	    *(double *)(buf + offset) = eval_double(init->expr);
+  1467	    return cur;
+  1468	  }
+  1469	
+  1470	  char **label = NULL;
+  1471	  uint64_t val = eval2(init->expr, &label);
+  1472	
+  1473	  if (!label) {
+  1474	    write_buf(buf + offset, val, ty->size);
+  1475	    return cur;
+  1476	  }
+  1477	
+  1478	  Relocation *rel = calloc(1, sizeof(Relocation));
+  1479	  rel->offset = offset;
+  1480	  rel->label = label;
+  1481	  rel->addend = val;
+  1482	  cur->next = rel;
+  1483	  return cur->next;
+  1484	}
+  1485	
+  1486	// Initializers for global variables are evaluated at compile-time and
+  1487	// embedded to .data section. This function serializes Initializer
+  1488	// objects to a flat byte array. It is a compile error if an
+  1489	// initializer list contains a non-constant expression.
+  1490	static void gvar_initializer(Token **rest, Token *tok, Obj *var) {
+  1491	  Initializer *init = initializer(rest, tok, var->ty, &var->ty);
+  1492	
+  1493	  Relocation head = {};
+  1494	  char *buf = calloc(1, var->ty->size);
+  1495	  write_gvar_data(&head, init, var->ty, buf, 0);
+  1496	  var->init_data = buf;
+  1497	  var->rel = head.next;
+  1498	}
+  1499	
+  1500	// Returns true if a given token represents a type.
+  1501	static bool is_typename(Token *tok) {
+  1502	  static HashMap map;
+  1503	
+  1504	  if (map.capacity == 0) {
+  1505	    static char *kw[] = {
+  1990	
+  1991	int64_t const_expr(Token **rest, Token *tok) {
+  1992	  Node *node = conditional(rest, tok);
+  1993	  return eval(node);
+  1994	}
+  1995	
+  1996	static double eval_double(Node *node) {
+  1997	  add_type(node);
+  1998	
+  1999	  if (is_integer(node->ty)) {
+  2000	    if (node->ty->is_unsigned)
+  2001	      return (unsigned long)eval(node);
+  2002	    return eval(node);
+  2003	  }
+  2004	
+  2005	  switch (node->kind) {
+  2006	  case ND_ADD:
+  2007	    return eval_double(node->lhs) + eval_double(node->rhs);
+  2008	  case ND_SUB:
+  2009	    return eval_double(node->lhs) - eval_double(node->rhs);
+  2010	  case ND_MUL:
+  2011	    return eval_double(node->lhs) * eval_double(node->rhs);
+  2012	  case ND_DIV:
+  2013	    return eval_double(node->lhs) / eval_double(node->rhs);
+  2014	  case ND_NEG:
+  2015	    return -eval_double(node->lhs);
+  2016	  case ND_COND:
+  2017	    return eval_double(node->cond) ? eval_double(node->then) : eval_double(node->els);
+  2018	  case ND_COMMA:
+  2019	    return eval_double(node->rhs);
+  2020	  case ND_CAST:
+  2021	    if (is_flonum(node->lhs->ty))
+  2022	      return eval_double(node->lhs);
+  2023	    return eval(node->lhs);
+  2024	  case ND_NUM:
+  2025	    return node->fval;
+  2026	  }
+  2027	
+  2028	  error_tok(node->tok, "not a compile-time constant");
+  2029	}
+  2030	
+  2031	// Convert op= operators to expressions containing an assignment.
+  2032	//
+  2033	// In general, `A op= C` is converted to ``tmp = &A, *tmp = *tmp op B`.
+  2034	// However, if a given expression is of form `A.x op= C`, the input is
+  2035	// converted to `tmp = &A, (*tmp).x = (*tmp).x op C` to handle assignments
+  2036	// to bitfields.
+  2037	static Node *to_assign(Node *binary) {
+  2038	  add_type(binary->lhs);
+  2039	  add_type(binary->rhs);
+  2040	  Token *tok = binary->tok;
+  2041	
+  2042	  // Convert `A.x op= C` to `tmp = &A, (*tmp).x = (*tmp).x op C`.
+  2043	  if (binary->lhs->kind == ND_MEMBER) {
+  2044	    Obj *var = new_lvar("", pointer_to(binary->lhs->lhs->ty));
+  2045	
+984:  *begin = const_expr(&tok, tok->next);
+989:    *end = const_expr(&tok, tok->next);
+995:    *end = *begin;
+1481:  rel->addend = val;
+1605:    int begin = const_expr(&tok, tok->next);
+1610:      end = const_expr(&tok, tok->next);
+1614:      end = begin;
+1620:    node->begin = begin;
+1621:    node->end = end;
+1622:    node->case_next = current_switch->case_next;
+1623:    current_switch->case_next = node;
+
+exec
+/bin/bash -lc "nl -ba cc/parse.c | sed -n '1810,1875p'; nl -ba cc/parse.c | sed -n '1995,2028p'; rg -n \"read_number|strtold|TY_LDOUBLE\" cc/tokenize.c cc/parse.c | head -80" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+  1810	  if (equal(tok, ";")) {
+  1811	    *rest = tok->next;
+  1812	    return new_node(ND_BLOCK, tok);
+  1813	  }
+  1814	
+  1815	  Node *node = new_node(ND_EXPR_STMT, tok);
+  1816	  node->lhs = expr(&tok, tok);
+  1817	  *rest = skip(tok, ";");
+  1818	  return node;
+  1819	}
+  1820	
+  1821	// expr = assign ("," expr)?
+  1822	static Node *expr(Token **rest, Token *tok) {
+  1823	  Node *node = assign(&tok, tok);
+  1824	
+  1825	  if (equal(tok, ","))
+  1826	    return new_binary(ND_COMMA, node, expr(rest, tok->next), tok);
+  1827	
+  1828	  *rest = tok;
+  1829	  return node;
+  1830	}
+  1831	
+  1832	static int64_t eval(Node *node) {
+  1833	  return eval2(node, NULL);
+  1834	}
+  1835	
+  1836	// Evaluate a given node as a constant expression.
+  1837	//
+  1838	// A constant expression is either just a number or ptr+n where ptr
+  1839	// is a pointer to a global variable and n is a postiive/negative
+  1840	// number. The latter form is accepted only as an initialization
+  1841	// expression for a global variable.
+  1842	static int64_t eval2(Node *node, char ***label) {
+  1843	  add_type(node);
+  1844	
+  1845	  if (is_flonum(node->ty))
+  1846	    return eval_double(node);
+  1847	
+  1848	  switch (node->kind) {
+  1849	  case ND_ADD:
+  1850	    return eval2(node->lhs, label) + eval(node->rhs);
+  1851	  case ND_SUB:
+  1852	    return eval2(node->lhs, label) - eval(node->rhs);
+  1853	  case ND_MUL:
+  1854	    return eval(node->lhs) * eval(node->rhs);
+  1855	  case ND_DIV:
+  1856	    if (node->ty->is_unsigned)
+  1857	      return (uint64_t)eval(node->lhs) / eval(node->rhs);
+  1858	    return eval(node->lhs) / eval(node->rhs);
+  1859	  case ND_NEG:
+  1860	    return -eval(node->lhs);
+  1861	  case ND_MOD:
+  1862	    if (node->ty->is_unsigned)
+  1863	      return (uint64_t)eval(node->lhs) % eval(node->rhs);
+  1864	    return eval(node->lhs) % eval(node->rhs);
+  1865	  case ND_BITAND:
+  1866	    return eval(node->lhs) & eval(node->rhs);
+  1867	  case ND_BITOR:
+  1868	    return eval(node->lhs) | eval(node->rhs);
+  1869	  case ND_BITXOR:
+  1870	    return eval(node->lhs) ^ eval(node->rhs);
+  1871	  case ND_SHL:
+  1872	    return eval(node->lhs) << eval(node->rhs);
+  1873	  case ND_SHR:
+  1874	    if (node->ty->is_unsigned && node->ty->size == 8)
+  1875	      return (uint64_t)eval(node->lhs) >> eval(node->rhs);
+  1995	
+  1996	static double eval_double(Node *node) {
+  1997	  add_type(node);
+  1998	
+  1999	  if (is_integer(node->ty)) {
+  2000	    if (node->ty->is_unsigned)
+  2001	      return (unsigned long)eval(node);
+  2002	    return eval(node);
+  2003	  }
+  2004	
+  2005	  switch (node->kind) {
+  2006	  case ND_ADD:
+  2007	    return eval_double(node->lhs) + eval_double(node->rhs);
+  2008	  case ND_SUB:
+  2009	    return eval_double(node->lhs) - eval_double(node->rhs);
+  2010	  case ND_MUL:
+  2011	    return eval_double(node->lhs) * eval_double(node->rhs);
+  2012	  case ND_DIV:
+  2013	    return eval_double(node->lhs) / eval_double(node->rhs);
+  2014	  case ND_NEG:
+  2015	    return -eval_double(node->lhs);
+  2016	  case ND_COND:
+  2017	    return eval_double(node->cond) ? eval_double(node->then) : eval_double(node->els);
+  2018	  case ND_COMMA:
+  2019	    return eval_double(node->rhs);
+  2020	  case ND_CAST:
+  2021	    if (is_flonum(node->lhs->ty))
+  2022	      return eval_double(node->lhs);
+  2023	    return eval(node->lhs);
+  2024	  case ND_NUM:
+  2025	    return node->fval;
+  2026	  }
+  2027	
+  2028	  error_tok(node->tok, "not a compile-time constant");
+cc/tokenize.c:437:  long double val = strtold(tok->loc, &end);
+
+exec
+/bin/bash -lc "nl -ba cc/parse.c | sed -n '3260,3375p'; nl -ba cc/tokenize.c | sed -n '423,475p'; nl -ba cc/preprocess.c | sed -n '1050,1110p'; nl -ba cc/parse.c | sed -n '400,455p'" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+  3260	
+  3261	  fn->body = compound_stmt(&tok, tok);
+  3262	  fn->locals = locals;
+  3263	  leave_scope();
+  3264	  resolve_goto_labels();
+  3265	  return tok;
+  3266	}
+  3267	
+  3268	static Token *global_variable(Token *tok, Type *basety, VarAttr *attr) {
+  3269	  bool first = true;
+  3270	
+  3271	  while (!consume(&tok, tok, ";")) {
+  3272	    if (!first)
+  3273	      tok = skip(tok, ",");
+  3274	    first = false;
+  3275	
+  3276	    Type *ty = declarator(&tok, tok, basety);
+  3277	    if (!ty->name)
+  3278	      error_tok(ty->name_pos, "variable name omitted");
+  3279	
+  3280	    Obj *var = new_gvar(get_ident(ty->name), ty);
+  3281	    var->is_definition = !attr->is_extern;
+  3282	    var->is_static = attr->is_static;
+  3283	    var->is_tls = attr->is_tls;
+  3284	    if (attr->align)
+  3285	      var->align = attr->align;
+  3286	
+  3287	    if (equal(tok, "="))
+  3288	      gvar_initializer(&tok, tok->next, var);
+  3289	    else if (!attr->is_extern && !attr->is_tls)
+  3290	      var->is_tentative = true;
+  3291	  }
+  3292	  return tok;
+  3293	}
+  3294	
+  3295	// Lookahead tokens and returns true if a given token is a start
+  3296	// of a function definition or declaration.
+  3297	static bool is_function(Token *tok) {
+  3298	  if (equal(tok, ";"))
+  3299	    return false;
+  3300	
+  3301	  Type dummy = {};
+  3302	  Type *ty = declarator(&tok, tok, &dummy);
+  3303	  return ty->kind == TY_FUNC;
+  3304	}
+  3305	
+  3306	// Remove redundant tentative definitions.
+  3307	static void scan_globals(void) {
+  3308	  Obj head;
+  3309	  Obj *cur = &head;
+  3310	
+  3311	  for (Obj *var = globals; var; var = var->next) {
+  3312	    if (!var->is_tentative) {
+  3313	      cur = cur->next = var;
+  3314	      continue;
+  3315	    }
+  3316	
+  3317	    // Find another definition of the same identifier.
+  3318	    Obj *var2 = globals;
+  3319	    for (; var2; var2 = var2->next)
+  3320	      if (var != var2 && var2->is_definition && !strcmp(var->name, var2->name))
+  3321	        break;
+  3322	
+  3323	    // If there's another definition, the tentative definition
+  3324	    // is redundant
+  3325	    if (!var2)
+  3326	      cur = cur->next = var;
+  3327	  }
+  3328	
+  3329	  cur->next = NULL;
+  3330	  globals = head.next;
+  3331	}
+  3332	
+  3333	static void declare_builtin_functions(void) {
+  3334	  Type *ty = func_type(pointer_to(ty_void));
+  3335	  ty->params = copy_type(ty_int);
+  3336	  builtin_alloca = new_gvar("alloca", ty);
+  3337	  builtin_alloca->is_definition = false;
+  3338	}
+  3339	
+  3340	// program = (typedef | function-definition | global-variable)*
+  3341	Obj *parse(Token *tok) {
+  3342	  declare_builtin_functions();
+  3343	  globals = NULL;
+  3344	
+  3345	  while (tok->kind != TK_EOF) {
+  3346	    VarAttr attr = {};
+  3347	    Type *basety = declspec(&tok, tok, &attr);
+  3348	
+  3349	    // Typedef
+  3350	    if (attr.is_typedef) {
+  3351	      tok = parse_typedef(tok, basety);
+  3352	      continue;
+  3353	    }
+  3354	
+  3355	    // Function
+  3356	    if (is_function(tok)) {
+  3357	      tok = function(tok, basety, &attr);
+  3358	      continue;
+  3359	    }
+  3360	
+  3361	    // Global variable
+  3362	    tok = global_variable(tok, basety, &attr);
+  3363	  }
+  3364	
+  3365	  for (Obj *var = globals; var; var = var->next)
+  3366	    if (var->is_root)
+  3367	      mark_live(var);
+  3368	
+  3369	  // Remove redundant tentative definitions.
+  3370	  scan_globals();
+  3371	  return globals;
+  3372	}
+   423	// The definition of the numeric literal at the preprocessing stage
+   424	// is more relaxed than the definition of that at the later stages.
+   425	// In order to handle that, a numeric literal is tokenized as a
+   426	// "pp-number" token first and then converted to a regular number
+   427	// token after preprocessing.
+   428	//
+   429	// This function converts a pp-number token to a regular number token.
+   430	static void convert_pp_number(Token *tok) {
+   431	  // Try to parse as an integer constant.
+   432	  if (convert_pp_int(tok))
+   433	    return;
+   434	
+   435	  // If it's not an integer, it must be a floating point constant.
+   436	  char *end;
+   437	  long double val = strtold(tok->loc, &end);
+   438	
+   439	  Type *ty;
+   440	  if (*end == 'f' || *end == 'F') {
+   441	    ty = ty_float;
+   442	    end++;
+   443	  } else if (*end == 'l' || *end == 'L') {
+   444	    ty = ty_ldouble;
+   445	    end++;
+   446	  } else {
+   447	    ty = ty_double;
+   448	  }
+   449	
+   450	  if (tok->loc + tok->len != end)
+   451	    error_tok(tok, "invalid numeric constant");
+   452	
+   453	  tok->kind = TK_NUM;
+   454	  tok->fval = val;
+   455	  tok->ty = ty;
+   456	}
+   457	
+   458	void convert_pp_tokens(Token *tok) {
+   459	  for (Token *t = tok; t->kind != TK_EOF; t = t->next) {
+   460	    if (is_keyword(t))
+   461	      t->kind = TK_KEYWORD;
+   462	    else if (t->kind == TK_PP_NUM)
+   463	      convert_pp_number(t);
+   464	  }
+   465	}
+   466	
+   467	// Initialize line info for all tokens.
+   468	static void add_line_numbers(Token *tok) {
+   469	  char *p = current_file->contents;
+   470	  int n = 1;
+   471	
+   472	  do {
+   473	    if (p == tok->loc) {
+   474	      tok->line_no = n;
+   475	      tok = tok->next;
+  1050	  };
+  1051	
+  1052	  return format("\"%s %2d %d\"", mon[tm->tm_mon], tm->tm_mday, tm->tm_year + 1900);
+  1053	}
+  1054	
+  1055	// __TIME__ is expanded to the current time, e.g. "13:34:03".
+  1056	static char *format_time(struct tm *tm) {
+  1057	  return format("\"%02d:%02d:%02d\"", tm->tm_hour, tm->tm_min, tm->tm_sec);
+  1058	}
+  1059	
+  1060	void init_macros(void) {
+  1061	  // Define predefined macros
+  1062	  define_macro("_LP64", "1");
+  1063	  define_macro("__C99_MACRO_WITH_VA_ARGS", "1");
+  1064	  define_macro("__ILP32__", "1");
+  1065	  define_macro("__LITTLE_ENDIAN__", "1");
+  1066	  define_macro("__ORDER_LITTLE_ENDIAN__", "1234");
+  1067	  define_macro("__ORDER_BIG_ENDIAN__", "4321");
+  1068	  define_macro("__BYTE_ORDER__", "1234");
+  1069	  define_macro("__wasm__", "1");
+  1070	  define_macro("__wasm32__", "1");
+  1071	  define_macro("__SIZEOF_DOUBLE__", "8");
+  1072	  define_macro("__SIZEOF_FLOAT__", "4");
+  1073	  define_macro("__SIZEOF_INT__", "4");
+  1074	  define_macro("__SIZEOF_LONG_DOUBLE__", "8");
+  1075	  define_macro("__SIZEOF_LONG_LONG__", "8");
+  1076	  define_macro("__SIZEOF_LONG__", "4");
+  1077	  define_macro("__SIZEOF_POINTER__", "4");
+  1078	  define_macro("__SIZEOF_PTRDIFF_T__", "4");
+  1079	  define_macro("__SIZEOF_SHORT__", "2");
+  1080	  define_macro("__SIZEOF_SIZE_T__", "4");
+  1081	  define_macro("__SIZE_TYPE__", "unsigned long");
+  1082	  define_macro("__STDC_HOSTED__", "1");
+  1083	  define_macro("__STDC_NO_COMPLEX__", "1");
+  1084	  define_macro("__STDC_UTF_16__", "1");
+  1085	  define_macro("__STDC_UTF_32__", "1");
+  1086	  define_macro("__STDC_VERSION__", "201112L");
+  1087	  define_macro("__STDC__", "1");
+  1088	  define_macro("__USER_LABEL_PREFIX__", "");
+  1089	  define_macro("__alignof__", "_Alignof");
+  1090	  define_macro("__chibicc__", "1");
+  1091	  define_macro("__const__", "const");
+  1092	  define_macro("__inline__", "inline");
+  1093	  define_macro("__signed__", "signed");
+  1094	  define_macro("__typeof__", "typeof");
+  1095	  define_macro("__volatile__", "volatile");
+  1096	  define_macro("linux", "1");
+  1097	  define_macro("unix", "1");
+  1098	
+  1099	  add_builtin("__FILE__", file_macro);
+  1100	  add_builtin("__LINE__", line_macro);
+  1101	  add_builtin("__COUNTER__", counter_macro);
+  1102	  add_builtin("__TIMESTAMP__", timestamp_macro);
+  1103	  add_builtin("__BASE_FILE__", base_file_macro);
+  1104	
+  1105	  time_t now = time(NULL);
+  1106	  struct tm *tm = localtime(&now);
+  1107	  define_macro("__DATE__", format_date(tm));
+  1108	  define_macro("__TIME__", format_time(tm));
+  1109	}
+  1110	
+   400	  Type *ty = ty_int;
+   401	  int counter = 0;
+   402	  bool is_atomic = false;
+   403	
+   404	  while (is_typename(tok)) {
+   405	    // Handle storage class specifiers.
+   406	    if (equal(tok, "typedef") || equal(tok, "static") || equal(tok, "extern") ||
+   407	        equal(tok, "inline") || equal(tok, "_Thread_local") || equal(tok, "__thread")) {
+   408	      if (!attr)
+   409	        error_tok(tok, "storage class specifier is not allowed in this context");
+   410	
+   411	      if (equal(tok, "typedef"))
+   412	        attr->is_typedef = true;
+   413	      else if (equal(tok, "static"))
+   414	        attr->is_static = true;
+   415	      else if (equal(tok, "extern"))
+   416	        attr->is_extern = true;
+   417	      else if (equal(tok, "inline"))
+   418	        attr->is_inline = true;
+   419	      else
+   420	        attr->is_tls = true;
+   421	
+   422	      if (attr->is_typedef &&
+   423	          attr->is_static + attr->is_extern + attr->is_inline + attr->is_tls > 1)
+   424	        error_tok(tok, "typedef may not be used together with static,"
+   425	                  " extern, inline, __thread or _Thread_local");
+   426	      tok = tok->next;
+   427	      continue;
+   428	    }
+   429	
+   430	    // These keywords are recognized but ignored.
+   431	    if (consume(&tok, tok, "const") || consume(&tok, tok, "volatile") ||
+   432	        consume(&tok, tok, "auto") || consume(&tok, tok, "register") ||
+   433	        consume(&tok, tok, "restrict") || consume(&tok, tok, "__restrict") ||
+   434	        consume(&tok, tok, "__restrict__") || consume(&tok, tok, "_Noreturn"))
+   435	      continue;
+   436	
+   437	    if (equal(tok, "_Atomic")) {
+   438	      tok = tok->next;
+   439	      if (equal(tok , "(")) {
+   440	        ty = typename(&tok, tok->next);
+   441	        tok = skip(tok, ")");
+   442	      }
+   443	      is_atomic = true;
+   444	      continue;
+   445	    }
+   446	
+   447	    if (equal(tok, "_Alignas")) {
+   448	      if (!attr)
+   449	        error_tok(tok, "_Alignas is not allowed in this context");
+   450	      tok = skip(tok->next, "(");
+   451	
+   452	      if (is_typename(tok))
+   453	        attr->align = typename(&tok, tok)->align;
+   454	      else
+   455	        attr->align = const_expr(&tok, tok);
+
+codex
+# Review: `cc/` wasm32 backend
+
+I found seven actionable issues: three miscompilations/ABI failures, one target-definition bug, and three cases where invalid or unsupported input is silently accepted or produces an invalid module.
+
+## 1. High: static `long double` initializers are serialized as integers
+
+Location: `cc/parse.c:1460-1474`
+
+`long double` is represented as an 8-byte IEEE-754 double, but global initialization only recognizes `TY_FLOAT` and `TY_DOUBLE`. A `TY_LDOUBLE` initializer falls through to `eval2()`, whose floating result is converted to `int64_t`, then written as integer bytes.
+
+```c
+long double x = 1.5L;
+
+int _start(void) {
+  return x == 1.5L ? 0 : 1;
+}
+```
+
+The stored bits become integer `1` (`0x0000000000000001`) rather than the double representation of `1.5`.
+
+Fix: treat `TY_LDOUBLE` exactly like `TY_DOUBLE` when serializing globals:
+
+```c
+if (ty->kind == TY_DOUBLE || ty->kind == TY_LDOUBLE) {
+  *(double *)(buf + offset) = eval_double(init->expr);
+  return cur;
+}
+```
+
+For host-independent output, serialize the IEEE-754 bits explicitly in little-endian form instead of writing through a host `double *`.
+
+## 2. High: 64-bit `switch` case values are truncated to 32 bits
+
+Locations:
+
+- `cc/parse.c:1605-1621`
+- `cc/codegen.c:662-669`
+- `cc/chibicc.h:269-271`
+
+Although `Node.begin` and `Node.end` are `long`, the parser first stores each constant in an `int`:
+
+```c
+long long f(long long x) {
+  switch (x) {
+  case 0x100000000LL:
+    return 1;
+  case 0:
+    return 2;
+  }
+  return 3;
+}
+```
+
+`0x100000000LL` becomes zero at `cc/parse.c:1605`, so the generated comparison is against zero. Case ranges have the same problem.
+
+Fix: make the parser temporaries `int64_t`:
+
+```c
+int64_t begin = const_expr(&tok, tok->next);
+int64_t end;
+```
+
+Prefer also changing `Node.begin/end` to `int64_t`, rather than host `long`, to make their width independent of the compiler host. Case values should ultimately be converted to the promoted type of the controlling expression before comparison.
+
+Duplicate cases created by truncation—and duplicate cases generally—should also be diagnosed.
+
+## 3. High: an old-style declaration followed by a prototyped definition breaks the ABI
+
+Locations:
+
+- `cc/parse.c:586-635`
+- `cc/parse.c:3209-3246`
+- `cc/codegen.c:782-805`
+
+An empty parameter list is represented as `is_variadic = true`. On redeclaration, `function()` reuses the existing `Obj` but never updates or reconciles `fn->ty`.
+
+```c
+int f();
+
+int f(int x) {
+  return x;
+}
+
+int _start(void) {
+  return f(7);
+}
+```
+
+Consequences:
+
+- `fn->params` is built from the definition and contains `x`.
+- `fn->ty` remains the old “variadic, zero fixed parameters” type.
+- `gen_function()` reserves a variadic wasm parameter because `fn->ty->is_variadic` is true.
+- No `fn->va_area` was created, because the definition itself is not variadic.
+- `cc/codegen.c:805` dereferences `fn->va_area`, typically crashing the compiler.
+
+Even if that crash is avoided, call sites parsed through `int f()` use the backend’s private varargs-pointer convention, while the definition expects ordinary positional parameters. Thus a call could pass the address of an 8-byte vararg area where the callee expects `x`.
+
+Fix options:
+
+1. Simplest and safest: reject prototype-less function types and old-style definitions with a clear diagnostic.
+2. Full support: preserve “unspecified parameters” as a state distinct from `...`, implement default argument promotions as positional wasm parameters, and reconcile every declaration with the eventual definition. Existing call ASTs may also need their effective signature updated after parsing the translation unit.
+
+Do not model `f()` as variadic; C’s unspecified-parameter form is not equivalent to `f(...)` and does not have a hidden `va_list` argument.
+
+Related issue: `is_compatible()` at `cc/type.c:58-63` considers every signed `TY_LONG` compatible regardless of size. After introducing distinct 32-bit `long` and 64-bit `long long` objects with the same `TypeKind`, compatibility checks must compare size/rank too.
+
+## 4. Medium: `_LP64` is predefined for an ILP32 target
+
+Location: `cc/preprocess.c:1062-1081`
+
+The compiler simultaneously defines `_LP64` and `__ILP32__`.
+
+```c
+#ifdef _LP64
+typedef unsigned long word_t;
+#else
+typedef unsigned long long word_t;
+#endif
+
+int check[sizeof(word_t) == 8 ? 1 : -1];
+```
+
+Under this compiler, the `_LP64` branch is selected even though `long` and pointers are four bytes. Real-world headers use `_LP64` to choose layouts and typedefs, so this can cause ABI or structure-layout mismatches.
+
+Fix: remove `_LP64`. Consider also removing the bare `linux` and `unix` macros at `cc/preprocess.c:1096-1097`, unless Linux compatibility is intentional; the emitted module is not itself a Linux target.
+
+## 5. Medium: out-of-range integer constants are silently assigned incorrect types/values
+
+Locations: `cc/tokenize.c:357-419`
+
+Decimal constants for which no signed type can represent the value are still assigned `long long`, and `strtoul()` overflow is not checked.
+
+```c
+long long a = 9223372036854775808;
+long long b = 9223372036854775808LL;
+unsigned long long c = 18446744073709551616ULL;
+```
+
+Problems:
+
+- Unsuffixed decimal `9223372036854775808` has no valid type in the target’s standard integer candidate list. It is classified as signed `long long` and stored as `INT64_MIN`.
+- Decimal `9223372036854775808LL` also does not fit its requested signed type but is accepted as `long long`.
+- Values above `UINT64_MAX` become whatever saturation/error behavior the host `strtoul()` supplies, because `errno` is ignored.
+- Parsing depends on host `unsigned long` width, even though the target ABI is fixed.
+
+The ordinary in-range ILP32 candidate ordering for `U`, `L`, `UL`, `LL`, and hexadecimal constants otherwise looks correct.
+
+Fix:
+
+- Parse into a checked `uint64_t` accumulator, or reset/check `errno == ERANGE`.
+- Select types by explicit maximum values.
+- Diagnose when no permitted target type can represent the literal.
+- In particular, decimal signed `LL` constants must be rejected above `INT64_MAX`; nondecimal `LL` may fall through to `unsigned long long`.
+
+## 6. Medium: atomic and TLS declarations can be silently accepted
+
+Locations:
+
+- `cc/parse.c:402-443`
+- `cc/parse.c:3276-3290`
+- `cc/codegen.c:363-369`
+- `cc/codegen.c:535-567`
+
+The backend documentation says atomics and TLS are unsupported, but errors are only issued for certain generated operations or when a TLS object’s address is actually emitted.
+
+```c
+_Atomic int x;
+
+int _start(void) {
+  x = 1;
+  return x;
+}
+```
+
+This compiles to ordinary non-atomic wasm loads and stores. There is no diagnostic for the lost atomic semantics.
+
+An unused TLS declaration can also be accepted:
+
+```c
+_Thread_local int x;
+int _start(void) { return 0; }
+```
+
+Fix: reject unsupported type/storage features independently of reachability:
+
+- Reject any object or member whose type has `is_atomic` during parsing or a complete program validation pass.
+- Reject every `Obj` with `is_tls`, even when unreferenced.
+- Apply the same early-validation principle to bitfields if the intent is that they are wholly unsupported; currently unused bitfields and some static initialization paths are accepted.
+
+## 7. Low: memory options can produce malformed modules or overflow layout arithmetic
+
+Locations:
+
+- `cc/main.c:40-41`
+- `cc/codegen.c:849-873`
+- `cc/codegen.c:963-966`
+
+Both options are parsed with unchecked `atoi()`, and layout is calculated in signed `int`.
+
+Examples:
+
+```sh
+cc -mmaxpages=70000 -o out.wasm input.c
+cc -mstack=-1 -o out.wasm input.c
+cc -mstack=2147483647 -o out.wasm input.c
+```
+
+WebAssembly 1.0 memory32 limits cannot exceed 65,536 pages. A value above that is emitted rather than rejected. Negative values are passed into unsigned LEB encoding or layout calculations, and a large stack can overflow `stack_top`/`heap_base`, potentially allowing stack/data overlap or producing an invalid initial limit.
+
+Fix:
+
+- Parse with `strtoull()` plus complete syntax/range checks.
+- Require `0 <= max_pages <= 65536`.
+- Require a positive, suitably aligned stack size.
+- Calculate data, stack, heap, and page counts in `uint64_t`.
+- Reject any address above `UINT32_MAX`, arithmetic overflow, or `min_pages > max_pages` before narrowing.
+
+## Other reviewed areas
+
+I did not find a backend-specific correctness problem in these paths:
+
+- `cast()`/`narrow()` correctly canonicalize `_Bool`, sign-extend signed `char`/`short`, and mask unsigned narrow types.
+- Signedness selection for integer division, remainder, relational comparisons, and right shift follows the converted left operand.
+- Float-to-integer wasm traps only occur for cases where C conversion is undefined; valid in-range conversions use the appropriate signed/unsigned opcode.
+- Fixed arguments are cast by the parser before code generation, and variadic `float` arguments are promoted to `double`.
+- The hidden struct-return pointer is consistently first in signatures, calls, and definitions.
+- Struct parameters are passed by address and copied into the callee’s frame.
+- `do`/`while` continuation targets the condition, and loop `continue`/`break` lookup remains correct through nested switches.
+- The nested-block switch lowering provides ordinary fallthrough. Unsupported case-label nesting is diagnosed.
+- Returns branch to the common epilogue, so `$sp` is restored once even from nested control flow.
+- `ND_COND`, `&&`, and `||` use correctly typed wasm blocks and preserve short-circuit behavior.
+- Type-section deduplication, section ordering, table offset/indexing, and element counts are internally consistent.
+- Module numbering and global layout are driven by source-list traversal rather than hash-map iteration, so I found no hash-order nondeterminism.
+
+One portability caveat remains: floating constants, initialized scalar data, and relocations are copied using host-native byte representation in `cc/codegen.c:148-149`, `cc/codegen.c:881-888`, and `cc/parse.c:1395-1417`. Output is deterministic on the current little-endian IEEE-754 host, but a genuinely host-independent compiler should serialize all target values explicitly in little-endian form.
+tokens used
+77,849
+# Review: `cc/` wasm32 backend
+
+I found seven actionable issues: three miscompilations/ABI failures, one target-definition bug, and three cases where invalid or unsupported input is silently accepted or produces an invalid module.
+
+## 1. High: static `long double` initializers are serialized as integers
+
+Location: `cc/parse.c:1460-1474`
+
+`long double` is represented as an 8-byte IEEE-754 double, but global initialization only recognizes `TY_FLOAT` and `TY_DOUBLE`. A `TY_LDOUBLE` initializer falls through to `eval2()`, whose floating result is converted to `int64_t`, then written as integer bytes.
+
+```c
+long double x = 1.5L;
+
+int _start(void) {
+  return x == 1.5L ? 0 : 1;
+}
+```
+
+The stored bits become integer `1` (`0x0000000000000001`) rather than the double representation of `1.5`.
+
+Fix: treat `TY_LDOUBLE` exactly like `TY_DOUBLE` when serializing globals:
+
+```c
+if (ty->kind == TY_DOUBLE || ty->kind == TY_LDOUBLE) {
+  *(double *)(buf + offset) = eval_double(init->expr);
+  return cur;
+}
+```
+
+For host-independent output, serialize the IEEE-754 bits explicitly in little-endian form instead of writing through a host `double *`.
+
+## 2. High: 64-bit `switch` case values are truncated to 32 bits
+
+Locations:
+
+- `cc/parse.c:1605-1621`
+- `cc/codegen.c:662-669`
+- `cc/chibicc.h:269-271`
+
+Although `Node.begin` and `Node.end` are `long`, the parser first stores each constant in an `int`:
+
+```c
+long long f(long long x) {
+  switch (x) {
+  case 0x100000000LL:
+    return 1;
+  case 0:
+    return 2;
+  }
+  return 3;
+}
+```
+
+`0x100000000LL` becomes zero at `cc/parse.c:1605`, so the generated comparison is against zero. Case ranges have the same problem.
+
+Fix: make the parser temporaries `int64_t`:
+
+```c
+int64_t begin = const_expr(&tok, tok->next);
+int64_t end;
+```
+
+Prefer also changing `Node.begin/end` to `int64_t`, rather than host `long`, to make their width independent of the compiler host. Case values should ultimately be converted to the promoted type of the controlling expression before comparison.
+
+Duplicate cases created by truncation—and duplicate cases generally—should also be diagnosed.
+
+## 3. High: an old-style declaration followed by a prototyped definition breaks the ABI
+
+Locations:
+
+- `cc/parse.c:586-635`
+- `cc/parse.c:3209-3246`
+- `cc/codegen.c:782-805`
+
+An empty parameter list is represented as `is_variadic = true`. On redeclaration, `function()` reuses the existing `Obj` but never updates or reconciles `fn->ty`.
+
+```c
+int f();
+
+int f(int x) {
+  return x;
+}
+
+int _start(void) {
+  return f(7);
+}
+```
+
+Consequences:
+
+- `fn->params` is built from the definition and contains `x`.
+- `fn->ty` remains the old “variadic, zero fixed parameters” type.
+- `gen_function()` reserves a variadic wasm parameter because `fn->ty->is_variadic` is true.
+- No `fn->va_area` was created, because the definition itself is not variadic.
+- `cc/codegen.c:805` dereferences `fn->va_area`, typically crashing the compiler.
+
+Even if that crash is avoided, call sites parsed through `int f()` use the backend’s private varargs-pointer convention, while the definition expects ordinary positional parameters. Thus a call could pass the address of an 8-byte vararg area where the callee expects `x`.
+
+Fix options:
+
+1. Simplest and safest: reject prototype-less function types and old-style definitions with a clear diagnostic.
+2. Full support: preserve “unspecified parameters” as a state distinct from `...`, implement default argument promotions as positional wasm parameters, and reconcile every declaration with the eventual definition. Existing call ASTs may also need their effective signature updated after parsing the translation unit.
+
+Do not model `f()` as variadic; C’s unspecified-parameter form is not equivalent to `f(...)` and does not have a hidden `va_list` argument.
+
+Related issue: `is_compatible()` at `cc/type.c:58-63` considers every signed `TY_LONG` compatible regardless of size. After introducing distinct 32-bit `long` and 64-bit `long long` objects with the same `TypeKind`, compatibility checks must compare size/rank too.
+
+## 4. Medium: `_LP64` is predefined for an ILP32 target
+
+Location: `cc/preprocess.c:1062-1081`
+
+The compiler simultaneously defines `_LP64` and `__ILP32__`.
+
+```c
+#ifdef _LP64
+typedef unsigned long word_t;
+#else
+typedef unsigned long long word_t;
+#endif
+
+int check[sizeof(word_t) == 8 ? 1 : -1];
+```
+
+Under this compiler, the `_LP64` branch is selected even though `long` and pointers are four bytes. Real-world headers use `_LP64` to choose layouts and typedefs, so this can cause ABI or structure-layout mismatches.
+
+Fix: remove `_LP64`. Consider also removing the bare `linux` and `unix` macros at `cc/preprocess.c:1096-1097`, unless Linux compatibility is intentional; the emitted module is not itself a Linux target.
+
+## 5. Medium: out-of-range integer constants are silently assigned incorrect types/values
+
+Locations: `cc/tokenize.c:357-419`
+
+Decimal constants for which no signed type can represent the value are still assigned `long long`, and `strtoul()` overflow is not checked.
+
+```c
+long long a = 9223372036854775808;
+long long b = 9223372036854775808LL;
+unsigned long long c = 18446744073709551616ULL;
+```
+
+Problems:
+
+- Unsuffixed decimal `9223372036854775808` has no valid type in the target’s standard integer candidate list. It is classified as signed `long long` and stored as `INT64_MIN`.
+- Decimal `9223372036854775808LL` also does not fit its requested signed type but is accepted as `long long`.
+- Values above `UINT64_MAX` become whatever saturation/error behavior the host `strtoul()` supplies, because `errno` is ignored.
+- Parsing depends on host `unsigned long` width, even though the target ABI is fixed.
+
+The ordinary in-range ILP32 candidate ordering for `U`, `L`, `UL`, `LL`, and hexadecimal constants otherwise looks correct.
+
+Fix:
+
+- Parse into a checked `uint64_t` accumulator, or reset/check `errno == ERANGE`.
+- Select types by explicit maximum values.
+- Diagnose when no permitted target type can represent the literal.
+- In particular, decimal signed `LL` constants must be rejected above `INT64_MAX`; nondecimal `LL` may fall through to `unsigned long long`.
+
+## 6. Medium: atomic and TLS declarations can be silently accepted
+
+Locations:
+
+- `cc/parse.c:402-443`
+- `cc/parse.c:3276-3290`
+- `cc/codegen.c:363-369`
+- `cc/codegen.c:535-567`
+
+The backend documentation says atomics and TLS are unsupported, but errors are only issued for certain generated operations or when a TLS object’s address is actually emitted.
+
+```c
+_Atomic int x;
+
+int _start(void) {
+  x = 1;
+  return x;
+}
+```
+
+This compiles to ordinary non-atomic wasm loads and stores. There is no diagnostic for the lost atomic semantics.
+
+An unused TLS declaration can also be accepted:
+
+```c
+_Thread_local int x;
+int _start(void) { return 0; }
+```
+
+Fix: reject unsupported type/storage features independently of reachability:
+
+- Reject any object or member whose type has `is_atomic` during parsing or a complete program validation pass.
+- Reject every `Obj` with `is_tls`, even when unreferenced.
+- Apply the same early-validation principle to bitfields if the intent is that they are wholly unsupported; currently unused bitfields and some static initialization paths are accepted.
+
+## 7. Low: memory options can produce malformed modules or overflow layout arithmetic
+
+Locations:
+
+- `cc/main.c:40-41`
+- `cc/codegen.c:849-873`
+- `cc/codegen.c:963-966`
+
+Both options are parsed with unchecked `atoi()`, and layout is calculated in signed `int`.
+
+Examples:
+
+```sh
+cc -mmaxpages=70000 -o out.wasm input.c
+cc -mstack=-1 -o out.wasm input.c
+cc -mstack=2147483647 -o out.wasm input.c
+```
+
+WebAssembly 1.0 memory32 limits cannot exceed 65,536 pages. A value above that is emitted rather than rejected. Negative values are passed into unsigned LEB encoding or layout calculations, and a large stack can overflow `stack_top`/`heap_base`, potentially allowing stack/data overlap or producing an invalid initial limit.
+
+Fix:
+
+- Parse with `strtoull()` plus complete syntax/range checks.
+- Require `0 <= max_pages <= 65536`.
+- Require a positive, suitably aligned stack size.
+- Calculate data, stack, heap, and page counts in `uint64_t`.
+- Reject any address above `UINT32_MAX`, arithmetic overflow, or `min_pages > max_pages` before narrowing.
+
+## Other reviewed areas
+
+I did not find a backend-specific correctness problem in these paths:
+
+- `cast()`/`narrow()` correctly canonicalize `_Bool`, sign-extend signed `char`/`short`, and mask unsigned narrow types.
+- Signedness selection for integer division, remainder, relational comparisons, and right shift follows the converted left operand.
+- Float-to-integer wasm traps only occur for cases where C conversion is undefined; valid in-range conversions use the appropriate signed/unsigned opcode.
+- Fixed arguments are cast by the parser before code generation, and variadic `float` arguments are promoted to `double`.
+- The hidden struct-return pointer is consistently first in signatures, calls, and definitions.
+- Struct parameters are passed by address and copied into the callee’s frame.
+- `do`/`while` continuation targets the condition, and loop `continue`/`break` lookup remains correct through nested switches.
+- The nested-block switch lowering provides ordinary fallthrough. Unsupported case-label nesting is diagnosed.
+- Returns branch to the common epilogue, so `$sp` is restored once even from nested control flow.
+- `ND_COND`, `&&`, and `||` use correctly typed wasm blocks and preserve short-circuit behavior.
+- Type-section deduplication, section ordering, table offset/indexing, and element counts are internally consistent.
+- Module numbering and global layout are driven by source-list traversal rather than hash-map iteration, so I found no hash-order nondeterminism.
+
+One portability caveat remains: floating constants, initialized scalar data, and relocations are copied using host-native byte representation in `cc/codegen.c:148-149`, `cc/codegen.c:881-888`, and `cc/parse.c:1395-1417`. Output is deterministic on the current little-endian IEEE-754 host, but a genuinely host-independent compiler should serialize all target values explicitly in little-endian form.
+CODEX_EXIT 0

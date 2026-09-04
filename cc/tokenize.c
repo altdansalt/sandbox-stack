@@ -354,7 +354,10 @@ static bool convert_pp_int(Token *tok) {
     base = 8;
   }
 
-  int64_t val = strtoul(p, &p, base);
+  errno = 0;
+  uint64_t val = strtoull(p, &p, base);
+  if (errno == ERANGE)
+    error_tok(tok, "integer literal is too large");
 
   // Read U, L or LL suffixes.
   bool l = false;
@@ -386,6 +389,8 @@ static bool convert_pp_int(Token *tok) {
 
   // Infer a type (ILP32: int and long are 4 bytes, long long is 8).
   Type *ty;
+  if (base == 10 && !u && (val >> 63))
+    error_tok(tok, "decimal integer literal is too large for any signed type");
   if (ll) {
     ty = u ? ty_ullong : (base != 10 && (val >> 63)) ? ty_ullong : ty_llong;
   } else if (base == 10) {

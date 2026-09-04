@@ -267,8 +267,8 @@ struct Node {
   Node *default_case;
 
   // Case
-  long begin;
-  long end;
+  int64_t begin;
+  int64_t end;
 
   // "asm" string literal
   char *asm_str;

@@ -60,7 +60,7 @@ bool is_compatible(Type *t1, Type *t2) {
   case TY_SHORT:
   case TY_INT:
   case TY_LONG:
-    return t1->is_unsigned == t2->is_unsigned;
+    return t1->is_unsigned == t2->is_unsigned && t1->size == t2->size;
   case TY_FLOAT:
   case TY_DOUBLE:
   case TY_LDOUBLE:

@@ -417,7 +417,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
       else if (equal(tok, "inline"))
         attr->is_inline = true;
       else
-        attr->is_tls = true;
+        error_tok(tok, "thread-local storage is not supported by the wasm backend");
 
       if (attr->is_typedef &&
           attr->is_static + attr->is_extern + attr->is_inline + attr->is_tls > 1)
@@ -440,7 +440,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
         ty = typename(&tok, tok->next);
         tok = skip(tok, ")");
       }
-      is_atomic = true;
+      error_tok(tok, "_Atomic is not supported by the wasm backend");
       continue;
     }
 
@@ -576,7 +576,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
 
   if (is_atomic) {
     ty = copy_type(ty);
-    ty->is_atomic = true;
+    error_tok(tok, "_Atomic is not supported by the wasm backend");
   }
 
   *rest = tok;
@@ -586,8 +586,10 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
 // func-params = ("void" | param ("," param)* ("," "...")?)? ")"
 // param       = declspec declarator
 static Type *func_params(Token **rest, Token *tok, Type *ty) {
-  if (equal(tok, "void") && equal(tok->next, ")")) {
-    *rest = tok->next->next;
+  // wasm backend: an empty parameter list means "no parameters", not
+  // "unspecified"; calls with arguments are then rejected as too many.
+  if ((equal(tok, "void") && equal(tok->next, ")")) || equal(tok, ")")) {
+    *rest = equal(tok, ")") ? tok->next : tok->next->next;
     return func_type(ty);
   }
 
@@ -1462,7 +1464,7 @@ write_gvar_data(Relocation *cur, Initializer *init, Type *ty, char *buf, int off
     return cur;
   }
 
-  if (ty->kind == TY_DOUBLE) {
+  if (ty->kind == TY_DOUBLE || ty->kind == TY_LDOUBLE) {
     *(double *)(buf + offset) = eval_double(init->expr);
     return cur;
   }
@@ -1602,8 +1604,8 @@ static Node *stmt(Token **rest, Token *tok) {
       error_tok(tok, "stray case");
 
     Node *node = new_node(ND_CASE, tok);
-    int begin = const_expr(&tok, tok->next);
-    int end;
+    int64_t begin = const_expr(&tok, tok->next);
+    int64_t end;
 
     if (equal(tok, "...")) {
       // [GNU] Case ranges, e.g. "case 1 ... 5:"
@@ -2579,7 +2581,7 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
       mem->align = attr.align ? attr.align : mem->ty->align;
 
       if (consume(&tok, tok, ":")) {
-        mem->is_bitfield = true;
+        error_tok(tok, "bitfields are not supported by the wasm backend");
         mem->bit_width = const_expr(&tok, tok);
       }
 
