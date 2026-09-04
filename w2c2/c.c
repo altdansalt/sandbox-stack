@@ -2,9 +2,6 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <math.h>
-#if HAS_PTHREAD
-  #include <pthread.h>
-#endif /* HAS_PTHREAD */
 #include <errno.h>
 #include <limits.h>
 #include "compat.h"
@@ -6210,132 +6207,6 @@ wasmCWriteImplementationFile(
     return true;
 }
 
-#if HAS_PTHREAD
-
-typedef struct WasmCImplementationWriterTask {
-    char filePrefix;
-    U32 fileIndex;
-    U32 functionsPerFile;
-    const WasmModule* module;
-    const char* moduleName;
-    const char* headerName;
-    U32 startFunctionIDIndex;
-    WasmFunctionIDs functionIDs;
-    bool pretty;
-    bool debug;
-    bool multipleModules;
-    bool result;
-    WasmDebugLines* debugLines;
-} WasmCImplementationWriterTask;
-
-typedef struct WasmCImplementationConcurrentWriter {
-    pthread_mutex_t mutex;
-    pthread_cond_t consume;
-    pthread_cond_t produce;
-    WasmCImplementationWriterTask* task;
-    bool done;
-} WasmCImplementationConcurrentWriter;
-
-static
-WasmCImplementationConcurrentWriter
-wasmCImplementationConcurrentWriterNew(
-    void
-) {
-    WasmCImplementationConcurrentWriter writer;
-    pthread_mutex_init(&writer.mutex, NULL);
-    pthread_cond_init(&writer.consume, NULL);
-    pthread_cond_init(&writer.produce, NULL);
-    writer.task = NULL;
-    writer.done = false;
-    return writer;
-}
-
-static
-void
-wasmCImplementationConcurrentWriterDestroy(
-    WasmCImplementationConcurrentWriter* writer
-) {
-    pthread_mutex_destroy(&writer->mutex);
-    pthread_cond_destroy(&writer->consume);
-    pthread_cond_destroy(&writer->produce);
-}
-
-static
-void*
-wasmCImplementationWriterThread(
-    void* arg
-) {
-    WasmCImplementationConcurrentWriter* writer = (WasmCImplementationConcurrentWriter*)arg;
-
-    while (true) {
-        pthread_mutex_lock(&writer->mutex);
-        pthread_cond_signal(&writer->produce);
-
-        while (!writer->done && writer->task == NULL) {
-            pthread_cond_wait(
-                &writer->consume,
-                &writer->mutex
-            );
-        }
-
-        if (writer->done) {
-            pthread_mutex_unlock(&writer->mutex);
-            return NULL;
-        }
-
-        {
-            const WasmCImplementationWriterTask* task = writer->task;
-
-            const WasmModule* module = task->module;
-            const char* moduleName = task->moduleName;
-            const char* headerName = task->headerName;
-            const char filePrefix = task->filePrefix;
-            const U32 fileIndex = task->fileIndex;
-            const U32 functionsPerFile = task->functionsPerFile;
-            const U32 startFunctionIDIndex = task->startFunctionIDIndex;
-            const WasmFunctionIDs functionIDs = task->functionIDs;
-            const bool pretty = task->pretty;
-            const bool debug = task->debug;
-            const bool multipleModules = task->multipleModules;
-            WasmDebugLines* debugLines = task->debugLines;
-
-            writer->task = NULL;
-
-            pthread_mutex_unlock(&writer->mutex);
-
-            {
-                const bool result = wasmCWriteImplementationFile(
-                    module,
-                    moduleName,
-                    headerName,
-                    debugLines,
-                    filePrefix,
-                    fileIndex,
-                    functionsPerFile,
-                    startFunctionIDIndex,
-                    functionIDs,
-                    pretty,
-                    debug,
-                    multipleModules
-                );
-                if (!result) {
-                    const WasmFunctionID startFunctionID = functionIDs.functionIDs[startFunctionIDIndex];
-                    fprintf(
-                        stderr,
-                        "w2c2: failed to write implementation file %d. start function index: %d\n",
-                        fileIndex,
-                        startFunctionID.functionIndex
-                    );
-                    exit(1);
-                }
-            }
-        }
-    }
-
-    return NULL;
-}
-
-#endif /* HAS_PTHREAD */
 
 static
 bool
@@ -6364,70 +6235,9 @@ wasmCWriteModuleImplementationFiles(
 
     {
 
-#if HAS_PTHREAD
-        U32 threadCount = options.threadCount;
-        pthread_t* threads = calloc(threadCount, sizeof(pthread_t));
-        U32 jobIndex = 0;
-
-        bool setDebugLines = options.debug && options.threadCount == 1;
-
-        WasmCImplementationConcurrentWriter writer = wasmCImplementationConcurrentWriterNew();
-
-        WasmCImplementationWriterTask task;
-        task.functionsPerFile = functionsPerFile;
-        task.module = module;
-        task.moduleName = moduleName;
-        task.headerName = headerName;
-        task.pretty = options.pretty;
-        task.debug = options.debug;
-        task.multipleModules = options.multipleModules;
-
-        for (; jobIndex < threadCount; jobIndex++) {
-            int err = pthread_create(
-                &threads[jobIndex],
-                NULL,
-                wasmCImplementationWriterThread,
-                &writer
-            );
-            if (err) {
-                fprintf(
-                    stderr,
-                    "w2c2: failed to create implementations thread: %s\n",
-                    strerror(err)
-                );
-                return false;
-            }
-        }
-#endif /* HAS_PTHREAD */
 
         for (; fileIndex < fileCount; fileIndex++) {
             U32 startFunctionIDIndex = fileIndex * functionsPerFile;
-#if HAS_PTHREAD
-            pthread_mutex_lock(&writer.mutex);
-
-            while (writer.task != NULL) {
-                pthread_cond_wait(
-                    &writer.produce,
-                    &writer.mutex
-                );
-            }
-
-            task.filePrefix = filePrefix;
-            task.fileIndex = fileIndex;
-            task.startFunctionIDIndex = startFunctionIDIndex;
-            task.functionIDs = functionIDs;
-            if (setDebugLines) {
-                task.debugLines = &debugLines;
-            } else {
-                task.debugLines = NULL;
-            }
-
-            writer.task = &task;
-
-            pthread_cond_signal(&writer.consume);
-            pthread_mutex_unlock(&writer.mutex);
-
-#else
             MUST (wasmCWriteImplementationFile(
                 module,
                 moduleName,
@@ -6442,35 +6252,7 @@ wasmCWriteModuleImplementationFiles(
                 options.debug,
                 options.multipleModules
             ))
-#endif /* HAS_PTHREAD */
         }
-#if HAS_PTHREAD
-
-        pthread_mutex_lock(&writer.mutex);
-
-        while (writer.task != NULL) {
-            pthread_cond_wait(
-                &writer.produce,
-                &writer.mutex
-            );
-        }
-
-        writer.done = true;
-        pthread_cond_broadcast(&writer.consume);
-        pthread_mutex_unlock(&writer.mutex);
-
-        for (jobIndex = 0; jobIndex < threadCount; jobIndex++) {
-            int err = pthread_join(threads[jobIndex], NULL);
-            if (err) {
-                fprintf(stderr, "w2c2: failed to join writer thread: %s\n", strerror(err));
-                return false;
-            }
-        }
-
-        free(threads);
-
-        wasmCImplementationConcurrentWriterDestroy(&writer);
-#endif /* HAS_PTHREAD */
     }
 
     return true;

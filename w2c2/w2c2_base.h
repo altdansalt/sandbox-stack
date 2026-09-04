@@ -13,9 +13,6 @@
 
 #include <errno.h>
 
-#ifdef __cplusplus
-extern "C" {
-#else
 
 #ifndef __bool_true_false_are_defined
 typedef enum bool {
@@ -24,7 +21,6 @@ typedef enum bool {
 } bool;
 #endif
 
-#endif
 
 typedef unsigned char U8;
 typedef signed char I8;
@@ -35,13 +31,8 @@ typedef signed short I16;
 typedef unsigned int U32;
 typedef signed int I32;
 
-#if defined(_MSC_VER) && _MSC_VER <= 1000
-typedef unsigned __int64 U64;
-typedef signed __int64 I64;
-#else
 typedef unsigned long long int U64;
 typedef signed long long int I64;
-#endif
 
 typedef float F32;
 typedef double F64;
@@ -49,18 +40,10 @@ typedef double F64;
 /* Only support for wasm32 for now */
 typedef U32 WasmPtr;
 
-#if defined(_MSC_VER) && _MSC_VER <= 1000
-#define W2C2_LL(x) x ## i64
-#else
 #define W2C2_LL(x) x ## ll
-#endif
 
 /* Prevent infinite loops from being optimized out when compiled as C++ */
-#ifdef __cplusplus
-#define W2C2_LOOP_START __asm__ volatile("");
-#else
 #define W2C2_LOOP_START
-#endif
 
 #define MUST(_) { if (!(_)) { return false; }; }
 
@@ -143,14 +126,6 @@ typedef U32 WasmPtr;
 #define swapU32(x) __builtin_bswap32(x)
 #define swapU64(x) __builtin_bswap64(x)
 
-#elif defined(__APPLE__)
-
-#include <libkern/OSByteOrder.h>
-
-#define swapU16(x) OSSwapInt16(x)
-#define swapU32(x) OSSwapInt32(x)
-#define swapU64(x) OSSwapInt64(x)
-
 #else
 
 /*
@@ -178,11 +153,7 @@ typedef U32 WasmPtr;
 
 #endif
 
-#ifdef _MSC_VER
-#define W2C2_INLINE __inline
-#else
 #define W2C2_INLINE __inline__
-#endif
 
 #define GCC_VERSION (__GNUC__ * 10000 \
                      + __GNUC_MINOR__ * 100 \
@@ -238,20 +209,6 @@ typedef U32 WasmPtr;
 #define UINT64_MAX W2C2_LL(18446744073709551615U)
 #endif
 
-#if defined(_MSC_VER) && _MSC_VER <= 1500
-
-/* disable warning C4756: overflow in constant arithmetic */
-#pragma warning(disable:4756 4056)
-
-#ifndef _HUGE_ENUF
-#define _HUGE_ENUF  1e+300  /* _HUGE_ENUF*_HUGE_ENUF must overflow */
-#endif
-
-#define INFINITY   ((float)(_HUGE_ENUF * _HUGE_ENUF))
-#define HUGE_VALF  ((float)INFINITY)
-#define HUGE_VALL  ((long double)INFINITY)
-#define NAN        ((float)(INFINITY * 0.0F))
-#endif
 
 #ifndef INFINITY
 #define INFINITY (1.0/0.0)
@@ -547,11 +504,6 @@ I64_CTZ(
 #define I64_TRUNC_SAT_U_F64(x) \
   TRUNC_SAT_U(U64, F64, (F64)UINT64_MAX, UINT64_MAX, x)
 
-#ifdef _WIN32
-#include <float.h>
-#define copysignf _copysignf
-#define copysign _copysign
-#endif
 
 #define DEFINE_REINTERPRET(name, t1, t2)  \
   static W2C2_INLINE t2 name(t1 x) {      \
@@ -878,18 +830,6 @@ load_data(
 #define readSwapU8(base, offset) (*(U8*)((base) + (offset)))
 #define writeSwapU8(base, offset, value) (*(U8*)((base) + (offset)) = (value))
 
-#if defined(__APPLE__)
-
-#include <libkern/OSByteOrder.h>
-#define readSwapU16(base, offset) OSReadSwapInt16(base, offset)
-#define readSwapU32(base, offset) OSReadSwapInt32(base, offset)
-#define readSwapU64(base, offset) OSReadSwapInt64(base, offset)
-
-#define writeSwapU16(base, offset, value) OSWriteSwapInt16(base, offset, value)
-#define writeSwapU32(base, offset, value) OSWriteSwapInt32(base, offset, value)
-#define writeSwapU64(base, offset, value) OSWriteSwapInt64(base, offset, value)
-
-#else
 
 static W2C2_INLINE U16 readSwapU16(const void* address, WasmPtr offset) {
     U16 result;
@@ -924,7 +864,6 @@ static W2C2_INLINE void writeSwapU64(void* address, WasmPtr offset, U64 v) {
     memcpy(address + offset, &v, sizeof(U64));
 }
 
-#endif
 
 #endif
 
@@ -1113,13 +1052,8 @@ DEFINE_SWAP(32, i, int)
 DEFINE_SWAP(32, I, unsigned int)
 DEFINE_SWAP(32, l, long)
 DEFINE_SWAP(32, L, unsigned long)
-#if defined(_MSC_VER) && _MSC_VER <= 1000
-DEFINE_SWAP(64, q, signed __int64)
-DEFINE_SWAP(64, Q, unsigned __int64)
-#else
 DEFINE_SWAP(64, q, long long)
 DEFINE_SWAP(64, Q, unsigned long long)
-#endif
 DEFINE_SWAP(32, f, float)
 DEFINE_SWAP(64, d, double)
 
@@ -1179,9 +1113,7 @@ typedef struct wasmModuleInstance {
 #define __has_extension __has_feature
 #endif
 
-#if defined(_MSC_VER) && _MSC_VER >= 1500
-#define WASM_ATOMICS_MSVC
-#elif defined(__GNUC__) && (GCC_VERSION >= 40700 || __has_extension(c_atomic))
+#if   defined(__GNUC__) && (GCC_VERSION >= 40700 || __has_extension(c_atomic))
 #define WASM_ATOMICS_GCC
 #endif
 
@@ -1531,8 +1463,5 @@ wasmMemoryAtomicNotify(
     U32 count
 );
 
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* W2C2_BASE_H */

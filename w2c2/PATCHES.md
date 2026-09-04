@@ -23,3 +23,7 @@ Upstream commit: see UPSTREAM. Diff against upstream: `diff -ru ~/src/w2c2/w2c2 
    `table.types[]` for each entry. `call_indirect` passes the expected canonical id:
    `TF(table, index, type_id, ctype)`; the runtime traps on mismatch. Canonical id = index of the first
    structurally identical entry of the type section (`wasmCanonicalFunctionTypeIndex`).
+6. Mechanical pruning with `unifdef -k -UHAS_PTHREAD -UHAS_LIBDWARF -UHAS_OLD_LIBDWARF -U_WIN32 -UHAS_GLOB -UHAS_LIBGEN -UHAS_STRDUP -UHAS_GETOPT -DHAS_UNISTD=1 -U__APPLE__ -U_MSC_VER -U__cplusplus`
+   over every `.c`/`.h`: removes the thread pool, libdwarf line tables (debug.c is now a 15-line stub),
+   Windows, glob/libgen/strdup/getopt fallbacks that this build never compiled. Output of the translator is
+   byte-identical before and after (checked on rot13.wasm and w2c2.wasm).

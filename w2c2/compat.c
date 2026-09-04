@@ -2,7 +2,6 @@
 #include "compat.h"
 #include "path.h"
 
-#if !HAS_LIBGEN
 
 /*
  * Taken from musl. Copyright © 2005-2020 Rich Felker, et al.
@@ -56,4 +55,3 @@ dirname(
     return s;
 }
 
-#endif /* !HAS_LIBGEN */

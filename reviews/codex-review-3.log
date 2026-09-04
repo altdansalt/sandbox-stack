@@ -1,0 +1,2851 @@
+OpenAI Codex v0.152.1
+--------
+workdir: /home/exedev/sandbox-stack
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: none
+reasoning summaries: none
+session id: 01a06e30-ae6c-7dd3-9f2f-b2ceaeee15b9
+--------
+user
+Review request: x86-64 assembler + static ELF writer for chibicc (cc/asm.c), and the x86 target integration.
+
+Context: NOTES.md section "Experiment 4". cc/asm.c is new (assembler for the GNU-syntax subset chibicc's codegen emits, plus an ELF64 writer). cc/codegen_x86.c is upstream chibicc's codegen.c with small changes (diff against ~/src/chibicc/codegen.c). Target selection: cc/main.c (-mx86), cc/type.c set_target_lp64, cc/parse.c (file-scope asm, struct-return and va_area conditionals), cc/preprocess.c macros. host/main.c has a __chibicc__ branch with a file-scope asm syscall stub.
+
+Verified so far: the instruction stream is identical to GNU as on ~1M instructions of real output (tests/asm-diff.sh), all probes/adversarial modules behave identically to tcc-built hosts, strace shows only prctl/read/write/exit.
+
+Please look for:
+1. Encoding bugs in paths NOT exercised by those inputs: 16-bit operands, high-byte registers, r8-r15 in every operand position (REX.B/REX.R), rsp/r12 and rbp/r13 as base registers (SIB / disp8 rules), imm8 vs imm32 selection incl. sign edge cases (-128, 127, 128, 0x80000000), mov $imm64, mov $imm to memory with size suffixes, shifts by immediate, setcc on sil/dil, all the SSE forms (movss/movsd load/store/reg-reg, movq both directions, cvtsi2ss/sd l/q, cvttss2si/cvttsd2si l/q, cvtss2sd, cvtsd2ss, ucomiss/ucomisd, addss..divsd, xorps/xorpd/pxor), test, imul, div/idiv, cqo/cdq, numeric local labels (1f), the ';'-separated multi-instruction cast strings in codegen_x86.c.
+2. Fixup/relocation math: rel32 for rip-relative operands when an immediate follows the displacement, jcc/jmp/call rel32, .quad sym+addend, symbols in .data/.bss, sign and range checks.
+3. ELF correctness: header fields, program header alignment rules, file offset vs vaddr congruence, bss sizing, entry, anything the kernel loader would reject or that would silently misplace data; also the security properties of the segments (is anything writable+executable?).
+4. Anything the assembler silently accepts wrongly instead of erroring (e.g. size-ambiguous instructions, unknown directives, malformed operands, duplicate labels, undefined symbols).
+5. Integration: -mx86 type sizes vs chibicc's x86 codegen assumptions (long double 16 bytes but x87 unsupported, va_area, struct return), file-scope asm parsing, opt_fcommon=false consequences, and whether the wasm path could be affected by the changes.
+
+Be concrete: file:line, a minimal assembly or C snippet that triggers the bug, expected vs actual bytes if you can, and the fix. Do not modify files. Write a markdown report to stdout.
+
+codex
+I’ll perform a read-only code review and return a concrete Markdown report with prioritized findings, trigger snippets, and fixes. I’ll first map the implementation and upstream diff, then validate suspicious encodings and ELF math against binutils where possible.
+exec
+/bin/bash -lc "sed -n '1,240p' cc/asm.c && sed -n '241,520p' cc/asm.c && sed -n '521,900p' cc/asm.c" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+// Assembler and static ELF64 writer for the subset of x86-64 GNU-syntax
+// assembly that chibicc's x86-64 codegen emits. Everything is one object:
+// symbols resolve within the image, so there are no relocations in the
+// output. Unknown instructions are errors, never silently skipped.
+//
+// Supported: integer moves/ALU/shift/setcc/jumps/call/ret, movzx/movsx
+// family, lea, push/pop, imul/idiv/div/mul/neg/not, cqo/cdq, rep stosb,
+// scalar SSE (movss/movsd/movq/cvt*/ucomis*/add/sub/mul/div/xorps/pxor),
+// syscall/hlt, and the directives .text .data .bss .align .byte .quad
+// .zero .comm .globl .local .type .size .file .loc .section(.text/.data).
+// Not supported: x87 (long double), TLS, atomics.
+#include "chibicc.h"
+
+typedef struct { uint8_t *data; int len, cap; } Sec;
+static Sec text, data;
+static long bss_len;
+static Sec *cur;               // current section, or NULL for .bss
+static bool cur_bss;
+
+typedef struct { int sec; long off; } Sym;  // sec: 0 text, 1 data, 2 bss
+static HashMap syms;
+
+typedef struct { int sec; long off; char *name; long addend; bool abs64; } Fixup;
+static Fixup *fixups;
+static int nfixups, fixcap;
+
+static int line_no;
+static char *cur_line;
+
+static noreturn void asm_error(char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  fprintf(stderr, "asm: line %d: ", line_no);
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n  %s\n", cur_line);
+  exit(1);
+}
+
+static void sec_u8(Sec *s, int v) {
+  if (s->len == s->cap) { s->cap = s->cap ? s->cap * 2 : 1 << 16; s->data = realloc(s->data, s->cap); }
+  s->data[s->len++] = (uint8_t)v;
+}
+static void emit8(int v) { sec_u8(cur, v); }
+static void emit32(uint32_t v) { for (int i = 0; i < 4; i++) emit8((v >> (8 * i)) & 0xff); }
+static void emit64(uint64_t v) { for (int i = 0; i < 8; i++) emit8((v >> (8 * i)) & 0xff); }
+
+static void add_fixup(char *name, long addend, bool abs64) {
+  if (nfixups == fixcap) { fixcap = fixcap ? fixcap * 2 : 1024; fixups = realloc(fixups, fixcap * sizeof(Fixup)); }
+  fixups[nfixups++] = (Fixup){ cur == &text ? 0 : 1, cur->len, name, addend, abs64 };
+}
+
+static void define_sym(char *name) {
+  Sym *s = calloc(1, sizeof(Sym));
+  s->sec = cur_bss ? 2 : (cur == &text ? 0 : 1);
+  s->off = cur_bss ? bss_len : cur->len;
+  if (hashmap_get(&syms, name)) asm_error("duplicate symbol %s", name);
+  hashmap_put(&syms, name, s);
+}
+
+// numeric local labels: "1:" defines, "1f" refers to the next definition
+static int numeric_count[10];
+static char *numeric_name(int n, int k) { return format(".num%d.%d", n, k); }
+
+// ---- operands ----
+enum { O_NONE, O_REG, O_IMM, O_MEM, O_LABEL };
+typedef struct {
+  int kind;
+  int reg, size;        // O_REG: register number 0-15, size 1/2/4/8, 16 for xmm; high8 for ah..bh
+  bool high8, xmm;
+  int64_t imm;          // O_IMM
+  int base;             // O_MEM: base register, -1 = rip
+  int64_t disp;
+  char *sym;            // O_MEM rip-relative symbol, or O_LABEL name
+  bool gotpcrel;        // sym@GOTPCREL: the value is the symbol's address (static image: encode as lea)
+} Op;
+
+static struct { char *name; int reg, size; bool high8, xmm; } regs[] = {
+  {"rax",0,8},{"rcx",1,8},{"rdx",2,8},{"rbx",3,8},{"rsp",4,8},{"rbp",5,8},{"rsi",6,8},{"rdi",7,8},
+  {"r8",8,8},{"r9",9,8},{"r10",10,8},{"r11",11,8},{"r12",12,8},{"r13",13,8},{"r14",14,8},{"r15",15,8},
+  {"eax",0,4},{"ecx",1,4},{"edx",2,4},{"ebx",3,4},{"esp",4,4},{"ebp",5,4},{"esi",6,4},{"edi",7,4},
+  {"r8d",8,4},{"r9d",9,4},{"r10d",10,4},{"r11d",11,4},{"r12d",12,4},{"r13d",13,4},{"r14d",14,4},{"r15d",15,4},
+  {"ax",0,2},{"cx",1,2},{"dx",2,2},{"bx",3,2},{"sp",4,2},{"bp",5,2},{"si",6,2},{"di",7,2},
+  {"r8w",8,2},{"r9w",9,2},{"r10w",10,2},{"r11w",11,2},{"r12w",12,2},{"r13w",13,2},{"r14w",14,2},{"r15w",15,2},
+  {"al",0,1},{"cl",1,1},{"dl",2,1},{"bl",3,1},{"spl",4,1},{"bpl",5,1},{"sil",6,1},{"dil",7,1},
+  {"r8b",8,1},{"r9b",9,1},{"r10b",10,1},{"r11b",11,1},{"r12b",12,1},{"r13b",13,1},{"r14b",14,1},{"r15b",15,1},
+  {"ah",4,1,true},{"ch",5,1,true},{"dh",6,1,true},{"bh",7,1,true},
+  {"xmm0",0,16,false,true},{"xmm1",1,16,false,true},{"xmm2",2,16,false,true},{"xmm3",3,16,false,true},
+  {"xmm4",4,16,false,true},{"xmm5",5,16,false,true},{"xmm6",6,16,false,true},{"xmm7",7,16,false,true},
+  {"rip",-1,8},
+};
+
+static bool parse_reg(char *s, Op *o) {
+  if (*s != '%') return false;
+  for (int i = 0; i < sizeof(regs) / sizeof(*regs); i++)
+    if (!strcmp(s + 1, regs[i].name)) {
+      o->kind = O_REG; o->reg = regs[i].reg; o->size = regs[i].size; o->high8 = regs[i].high8; o->xmm = regs[i].xmm;
+      return true;
+    }
+  asm_error("unknown register %s", s);
+}
+
+static char *trim(char *s) {
+  while (isspace(*s)) s++;
+  char *e = s + strlen(s);
+  while (e > s && isspace(e[-1])) *--e = 0;
+  return s;
+}
+
+static bool is_symchar(int c) { return isalnum(c) || c == '_' || c == '.' || c == '$'; }
+
+static Op parse_op(char *s) {
+  Op o = {0};
+  s = trim(s);
+  if (*s == '%') { parse_reg(s, &o); return o; }
+  if (*s == '$') {
+    o.kind = O_IMM;
+    char *end;
+    errno = 0;
+    if (s[1] == '-') o.imm = strtoll(s + 1, &end, 0);
+    else o.imm = (int64_t)strtoull(s + 1, &end, 0);
+    if (*end || errno) asm_error("bad immediate %s", s);
+    return o;
+  }
+  char *paren = strchr(s, '(');
+  if (paren) {
+    o.kind = O_MEM;
+    char *close = strchr(paren, ')');
+    if (!close || close[1]) asm_error("bad memory operand %s", s);
+    *close = 0;
+    Op b = {0};
+    if (strchr(paren + 1, ',')) asm_error("index registers are not supported: %s", s);
+    parse_reg(paren + 1, &b);
+    o.base = b.reg;
+    *paren = 0;
+    s = trim(s);
+    if (*s == 0) { o.disp = 0; }
+    else if (*s == '-' || isdigit(*s)) { char *end; o.disp = strtoll(s, &end, 10); if (*end) asm_error("bad displacement %s", s); }
+    else {
+      if (o.base != -1) asm_error("symbolic displacement needs %%rip");
+      char *at = strstr(s, "@GOTPCREL");
+      if (at) { *at = 0; o.gotpcrel = true; }  // static image: the GOT slot would hold the symbol's address
+      o.sym = strdup(s);
+    }
+    return o;
+  }
+  if (isdigit(*s) && s[1] == 'f' && !s[2]) { o.kind = O_LABEL; o.sym = numeric_name(*s - '0', numeric_count[*s - '0'] + 1); return o; }
+  if (*s == '*') { if (s[1] != '%') asm_error("indirect operand must be a register: %s", s); parse_reg(s + 1, &o); return o; }
+  o.kind = O_LABEL; o.sym = strdup(s);
+  return o;
+}
+
+// ---- encoding ----
+typedef struct {
+  int prefix;     // 0, 0x66, 0xF2, 0xF3 (mandatory prefix, before REX)
+  bool w;         // REX.W
+  bool need_rex;  // force REX (sil/dil/spl/bpl)
+  uint8_t op[3]; int oplen;
+  int reg;        // ModRM.reg field (register number or /digit)
+  Op *rm;         // O_REG or O_MEM, or NULL for no ModRM
+  int imm_size;   // 0,1,2,4,8
+  int64_t imm;
+  bool opsize16;  // 0x66 operand-size prefix
+} Enc;
+
+static void encode(Enc *e) {
+  if (e->opsize16) emit8(0x66);
+  if (e->prefix) emit8(e->prefix);
+  int rex = 0x40;
+  if (e->w) rex |= 8;
+  if (e->reg >= 8) rex |= 4;
+  bool has_rm = e->rm != NULL;
+  if (has_rm) {
+    if (e->rm->kind == O_REG && e->rm->reg >= 8) rex |= 1;
+    if (e->rm->kind == O_MEM && e->rm->base >= 8) rex |= 1;
+    if (e->rm->kind == O_REG && e->rm->high8 && rex != 0x40) asm_error("high byte register with REX");
+  }
+  if (rex != 0x40 || e->need_rex) emit8(rex);
+  for (int i = 0; i < e->oplen; i++) emit8(e->op[i]);
+  if (has_rm) {
+    int r = e->reg & 7;
+    if (e->rm->kind == O_REG) {
+      emit8(0xC0 | (r << 3) | (e->rm->reg & 7));
+    } else if (e->rm->base == -1) {
+      emit8((r << 3) | 5);
+      add_fixup(e->rm->sym, e->rm->disp - 4 - e->imm_size, false);
+      emit32(0);
+    } else {
+      int b = e->rm->base & 7;
+      int64_t d = e->rm->disp;
+      int mod = (d == 0 && b != 5) ? 0 : (d >= -128 && d <= 127) ? 1 : 2;
+      emit8((mod << 6) | (r << 3) | b);
+      if (b == 4) emit8(0x24); // SIB for rsp/r12 base
+      if (mod == 1) emit8((int)d & 0xff);
+      else if (mod == 2) { if (d < INT32_MIN || d > INT32_MAX) asm_error("displacement out of range"); emit32((uint32_t)d); }
+    }
+  }
+  switch (e->imm_size) {
+  case 0: break;
+  case 1: emit8((int)e->imm & 0xff); break;
+  case 2: emit8(e->imm & 0xff); emit8((e->imm >> 8) & 0xff); break;
+  case 4: emit32((uint32_t)e->imm); break;
+  case 8: emit64((uint64_t)e->imm); break;
+  }
+}
+
+static bool fits8(int64_t v) { return v >= -128 && v <= 127; }
+static bool fits32(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
+
+static int op_size(Op *a, Op *b, char suffix) {
+  if (a && a->kind == O_REG && !a->xmm) return a->size;
+  if (b && b->kind == O_REG && !b->xmm) return b->size;
+  switch (suffix) { case 'b': return 1; case 'w': return 2; case 'l': return 4; case 'q': return 8; }
+  asm_error("cannot determine operand size");
+}
+
+static void set_size(Enc *e, int size, uint8_t op8, uint8_t op) {
+  e->op[0] = size == 1 ? op8 : op; e->oplen = 1;
+  e->w = size == 8; e->opsize16 = size == 2;
+}
+
+static void need_rex_for(Enc *e, Op *r) {
+  if (r && r->kind == O_REG && r->size == 1 && !r->high8 && r->reg >= 4 && r->reg <= 7) e->need_rex = true;
+}
+
+// group-1 ALU: add=0 or=1 and=4 sub=5 xor=6 cmp=7
+static void alu(int n, Op *src, Op *dst, char suffix) {
+  Enc e = {0};
+  int size = op_size(dst, src, suffix);
+  if (src->kind == O_IMM) {
+    if (dst->kind != O_REG && dst->kind != O_MEM) asm_error("bad ALU destination");
+    e.rm = dst; e.reg = n;
+    if (size == 1) { e.op[0] = 0x80; e.imm_size = 1; }
+    else if (fits8(src->imm)) { e.op[0] = 0x83; e.imm_size = 1; }
+    else { e.op[0] = 0x81; e.imm_size = size == 2 ? 2 : 4; if (!fits32(src->imm)) asm_error("immediate too large"); }
+    e.oplen = 1; e.w = size == 8; e.opsize16 = size == 2; e.imm = src->imm;
+    need_rex_for(&e, dst);
+    encode(&e);
+    return;
+  }
+  if (src->kind == O_REG && (dst->kind == O_REG || dst->kind == O_MEM)) {  // op r, r/m  (r is source)
+    set_size(&e, size, n * 8, n * 8 + 1); e.reg = src->reg; e.rm = dst;
+    need_rex_for(&e, src); need_rex_for(&e, dst);
+    encode(&e);
+    return;
+  }
+  if (src->kind == O_MEM && dst->kind == O_REG) {  // op r/m, r
+    set_size(&e, size, n * 8 + 2, n * 8 + 3); e.reg = dst->reg; e.rm = src;
+    need_rex_for(&e, dst);
+    encode(&e);
+    return;
+  }
+  asm_error("unsupported ALU operands");
+}
+
+static void mov(Op *src, Op *dst, char suffix) {
+  Enc e = {0};
+  if ((src->kind == O_REG && src->xmm) || (dst->kind == O_REG && dst->xmm)) asm_error("use movq/movss/movsd for xmm");
+  int size = op_size(dst, src, suffix);
+  if (src->kind == O_IMM) {
+    if (dst->kind == O_REG) {
+      if (size == 8 && !fits32(src->imm)) { e.w = true; e.op[0] = 0xB8 + (dst->reg & 7); e.oplen = 1; e.imm_size = 8; e.imm = src->imm; if (dst->reg >= 8) { e.rm = NULL; e.reg = 0; /* REX.B via manual */ }
+        // manual REX for the B8+r form
+        emit8(0x48 | (dst->reg >= 8 ? 1 : 0)); emit8(0xB8 + (dst->reg & 7)); emit64((uint64_t)src->imm); return; }
+      if (size == 8) { e.w = true; e.op[0] = 0xC7; e.oplen = 1; e.reg = 0; e.rm = dst; e.imm_size = 4; e.imm = src->imm; encode(&e); return; }
+      // B0+r / B8+r
+      if (size == 1) { if (!fits8(src->imm) && src->imm > 255) asm_error("immediate too large"); }
+      if (size == 2) e.opsize16 = true;
+      int rex = 0x40 | (dst->reg >= 8 ? 1 : 0);
+      if (rex != 0x40 || (size == 1 && dst->reg >= 4 && dst->reg <= 7 && !dst->high8)) emit8(rex);
+      if (e.opsize16) emit8(0x66);
+      emit8((size == 1 ? 0xB0 : 0xB8) + (dst->reg & 7));
+      if (size == 1) emit8(src->imm & 0xff); else if (size == 2) { emit8(src->imm & 0xff); emit8((src->imm >> 8) & 0xff); } else emit32((uint32_t)src->imm);
+      return;
+    }
+    if (dst->kind == O_MEM) {
+      set_size(&e, size, 0xC6, 0xC7); e.reg = 0; e.rm = dst; e.imm_size = size == 8 ? 4 : size == 2 ? 2 : size; e.imm = src->imm;
+      if (size == 8 && !fits32(src->imm)) asm_error("immediate too large for memory store");
+      encode(&e); return;
+    }
+  }
+  if (src->kind == O_REG && (dst->kind == O_REG || dst->kind == O_MEM)) {
+    set_size(&e, size, 0x88, 0x89); e.reg = src->reg; e.rm = dst; need_rex_for(&e, src); need_rex_for(&e, dst); encode(&e); return;
+  }
+  if (src->kind == O_MEM && dst->kind == O_REG) {
+    if (src->gotpcrel) { if (size != 8) asm_error("GOTPCREL load into a non-64-bit register"); e.op[0] = 0x8D; e.oplen = 1; e.w = true; e.reg = dst->reg; e.rm = src; encode(&e); return; }
+    set_size(&e, size, 0x8A, 0x8B); e.reg = dst->reg; e.rm = src; need_rex_for(&e, dst); encode(&e); return;
+  }
+  asm_error("unsupported mov operands");
+}
+
+// movs*/movz* family: mnemonic gives sign and source width; destination width from register
+static void movx(char *mn, Op *src, Op *dst) {
+  bool sign = mn[3] == 's';
+  int srcsize;
+  char *rest = mn + 4;   // after "movs"/"movz"
+  if (!strcmp(mn, "movsxd") || !strcmp(mn, "movslq")) srcsize = 4;
+  else if (*rest == 'b') srcsize = 1;
+  else if (*rest == 'w') srcsize = 2;
+  else if (*rest == 'x' || *rest == 0) { // movzx / movzb without suffix: source size from register
+    if (src->kind != O_REG) asm_error("%s needs a register source", mn); srcsize = src->size;
+  } else asm_error("unknown extension %s", mn);
+  if (dst->kind != O_REG) asm_error("%s needs a register destination", mn);
+  Enc e = {0};
+  if (srcsize == 4) { e.w = true; e.op[0] = 0x63; e.oplen = 1; }
+  else { e.op[0] = 0x0F; e.op[1] = (sign ? 0xBE : 0xB6) + (srcsize == 2 ? 1 : 0); e.oplen = 2; e.w = dst->size == 8; e.opsize16 = dst->size == 2; }
+  e.reg = dst->reg; e.rm = src; need_rex_for(&e, src);
+  encode(&e);
+}
+
+static int cc_code(char *s) {
+  static struct { char *n; int c; } t[] = {
+    {"o",0},{"no",1},{"b",2},{"c",2},{"nae",2},{"ae",3},{"nb",3},{"e",4},{"z",4},{"ne",5},{"nz",5},{"be",6},{"na",6},
+    {"a",7},{"nbe",7},{"s",8},{"ns",9},{"p",10},{"np",11},{"l",12},{"ge",13},{"le",14},{"g",15},
+  };
+  for (int i = 0; i < sizeof(t) / sizeof(*t); i++) if (!strcmp(t[i].n, s)) return t[i].c;
+  return -1;
+}
+
+static void sse(int prefix, uint8_t op, Op *src, Op *dst, bool w, bool xmm_in_reg_field_is_dst) {
+  // generic "op xmm/m, xmm" form: reg field = dst xmm, rm = src
+  Enc e = {0};
+  e.prefix = prefix; e.op[0] = 0x0F; e.op[1] = op; e.oplen = 2; e.w = w;
+  if (xmm_in_reg_field_is_dst) { e.reg = dst->reg; e.rm = src; }
+  else { e.reg = src->reg; e.rm = dst; }
+  encode(&e);
+}
+
+static void instruction(char *mn, char *rest) {
+  Op ops[3]; int n = 0;
+  if (rest && *rest) {
+    char *p = rest;
+    while (n < 3) {
+      char *comma = strchr(p, ',');
+      if (comma) *comma = 0;
+      ops[n++] = parse_op(p);
+      if (!comma) break;
+      p = comma + 1;
+    }
+  }
+  Op *a = n > 0 ? &ops[0] : NULL, *b = n > 1 ? &ops[1] : NULL;
+  size_t L = strlen(mn);
+  char suffix = 0;
+
+  // prefixes
+  if (!strcmp(mn, "rep")) {
+    if (!strcmp(trim(rest), "stosb")) { emit8(0xF3); emit8(0xAA); return; }
+    asm_error("unsupported rep instruction");
+  }
+  if (!strcmp(mn, "lock") || !strcmp(mn, "data16") || !strcmp(mn, "rex64")) asm_error("atomics/TLS are not supported");
+
+  // no-operand instructions
+  if (n == 0) {
+    if (!strcmp(mn, "ret")) { emit8(0xC3); return; }
+    if (!strcmp(mn, "cqo") || !strcmp(mn, "cqto")) { emit8(0x48); emit8(0x99); return; }
+    if (!strcmp(mn, "cdq") || !strcmp(mn, "cltd")) { emit8(0x99); return; }
+    if (!strcmp(mn, "syscall")) { emit8(0x0F); emit8(0x05); return; }
+    if (!strcmp(mn, "hlt")) { emit8(0xF4); return; }
+    if (!strcmp(mn, "nop")) { emit8(0x90); return; }
+    if (mn[0] == 'f') asm_error("x87 (long double) is not supported");
+    asm_error("unknown instruction %s", mn);
+  }
+
+  // control flow
+  if (!strcmp(mn, "jmp") || !strcmp(mn, "call")) {
+    if (a->kind == O_LABEL) { emit8(!strcmp(mn, "jmp") ? 0xE9 : 0xE8); add_fixup(a->sym, -4, false); emit32(0); return; }
+    if (a->kind == O_REG && a->size == 8) { Enc e = {0}; e.op[0] = 0xFF; e.oplen = 1; e.reg = !strcmp(mn, "jmp") ? 4 : 2; e.rm = a; encode(&e); return; }
+    asm_error("bad %s operand", mn);
+  }
+  if (mn[0] == 'j' && a->kind == O_LABEL) {
+    int cc = cc_code(mn + 1);
+    if (cc < 0) asm_error("unknown jump %s", mn);
+    emit8(0x0F); emit8(0x80 + cc); add_fixup(a->sym, -4, false); emit32(0); return;
+  }
+  if (!strncmp(mn, "set", 3) && n == 1) {
+    int cc = cc_code(mn + 3);
+    if (cc < 0 || a->kind != O_REG || a->size != 1) asm_error("bad setcc");
+    Enc e = {0}; e.op[0] = 0x0F; e.op[1] = 0x90 + cc; e.oplen = 2; e.reg = 0; e.rm = a; need_rex_for(&e, a); encode(&e); return;
+  }
+
+  // SSE
+  if (!strcmp(mn, "movss") || !strcmp(mn, "movsd")) {
+    int pfx = mn[4] == 's' ? 0xF3 : 0xF2;
+    if (b->kind == O_REG && b->xmm) { sse(pfx, 0x10, a, b, false, true); return; }       // load / reg-reg
+    if (a->kind == O_REG && a->xmm && b->kind == O_MEM) { sse(pfx, 0x11, a, b, false, false); return; } // store
+    asm_error("bad %s operands", mn);
+  }
+  if (!strcmp(mn, "movq") && ((a->kind == O_REG && a->xmm) || (b->kind == O_REG && b->xmm))) {
+    if (b->xmm) { Enc e = {0}; e.prefix = 0x66; e.w = true; e.op[0] = 0x0F; e.op[1] = 0x6E; e.oplen = 2; e.reg = b->reg; e.rm = a; encode(&e); return; }
+    Enc e = {0}; e.prefix = 0x66; e.w = true; e.op[0] = 0x0F; e.op[1] = 0x7E; e.oplen = 2; e.reg = a->reg; e.rm = b; encode(&e); return;
+  }
+  if (!strncmp(mn, "cvtsi2s", 7)) {  // cvtsi2ss[lq] / cvtsi2sd[lq]: int -> float
+    int pfx = mn[7] == 's' ? 0xF3 : 0xF2;
+    bool w = mn[8] == 'q' || (mn[8] == 0 && a->kind == O_REG && a->size == 8);
+    sse(pfx, 0x2A, a, b, w, true); return;
+  }
+  if (!strncmp(mn, "cvtts", 5)) {    // cvttss2si[lq] / cvttsd2si[lq]: float -> int
+    int pfx = mn[5] == 's' ? 0xF3 : 0xF2;
+    bool w = b->size == 8;
+    Enc e = {0}; e.prefix = pfx; e.op[0] = 0x0F; e.op[1] = 0x2C; e.oplen = 2; e.w = w; e.reg = b->reg; e.rm = a; encode(&e); return;
+  }
+  if (!strcmp(mn, "cvtss2sd")) { sse(0xF3, 0x5A, a, b, false, true); return; }
+  if (!strcmp(mn, "cvtsd2ss")) { sse(0xF2, 0x5A, a, b, false, true); return; }
+  if (!strcmp(mn, "ucomiss")) { sse(0, 0x2E, a, b, false, true); return; }
+  if (!strcmp(mn, "ucomisd")) { sse(0x66, 0x2E, a, b, false, true); return; }
+  if (!strcmp(mn, "xorps")) { sse(0, 0x57, a, b, false, true); return; }
+  if (!strcmp(mn, "xorpd")) { sse(0x66, 0x57, a, b, false, true); return; }
+  if (!strcmp(mn, "pxor")) { sse(0x66, 0xEF, a, b, false, true); return; }
+  {
+    static struct { char *n; int op; } arith[] = {{"add",0x58},{"mul",0x59},{"sub",0x5C},{"div",0x5E}};
+    for (int i = 0; i < 4; i++)
+      if (!strncmp(mn, arith[i].n, 3) && L == 5 && mn[3] == 's' && (mn[4] == 's' || mn[4] == 'd')) {
+        sse(mn[4] == 's' ? 0xF3 : 0xF2, arith[i].op, a, b, false, true); return;
+      }
+  }
+  if (mn[0] == 'f') asm_error("x87 (long double) is not supported");
+
+  // movs*/movz*
+  if (!strncmp(mn, "movs", 4) || !strncmp(mn, "movz", 4)) {
+    if (n != 2) asm_error("bad %s", mn);
+    if (!strcmp(mn, "movsd") || !strcmp(mn, "movss")) asm_error("unreachable");
+    movx(mn, a, b); return;
+  }
+
+  // integer mov / alu with optional size suffix
+  char stem[16];
+  strcpy(stem, mn);
+  if (L > 3 && strchr("bwlq", mn[L - 1]) && (!strncmp(mn, "mov", 3) || !strncmp(mn, "add", 3) || !strncmp(mn, "sub", 3) ||
+      !strncmp(mn, "and", 3) || !strncmp(mn, "cmp", 3) || !strncmp(mn, "xor", 3) || !strncmp(mn, "or", 2) ||
+      !strncmp(mn, "test", 4) || !strncmp(mn, "imul", 4) || !strncmp(mn, "idiv", 4) || !strncmp(mn, "div", 3) ||
+      !strncmp(mn, "neg", 3) || !strncmp(mn, "not", 3) || !strncmp(mn, "shl", 3) || !strncmp(mn, "shr", 3) || !strncmp(mn, "sar", 3) ||
+      !strncmp(mn, "push", 4) || !strncmp(mn, "pop", 3) || !strncmp(mn, "lea", 3) || !strncmp(mn, "inc", 3) || !strncmp(mn, "dec", 3))) {
+    if (strcmp(mn, "mul") && strcmp(mn, "shl") && strcmp(mn, "shr") && strcmp(mn, "sarl") ) {
+      // only strip when the stem is a known mnemonic (avoid "mul"->"mu")
+      static char *stems[] = {"mov","add","sub","and","cmp","xor","or","test","imul","idiv","div","neg","not","shl","shr","sar","push","pop","lea","inc","dec"};
+      for (int i = 0; i < sizeof(stems) / sizeof(*stems); i++)
+        if (strlen(stems[i]) == L - 1 && !strncmp(mn, stems[i], L - 1)) { suffix = mn[L - 1]; stem[L - 1] = 0; break; }
+    }
+  }
+  mn = stem;
+
+  if (!strcmp(mn, "mov")) { if (n != 2) asm_error("bad mov"); mov(a, b, suffix); return; }
+  if (!strcmp(mn, "lea")) {
+    if (n != 2 || a->kind != O_MEM || b->kind != O_REG) asm_error("bad lea");
+    Enc e = {0}; e.op[0] = 0x8D; e.oplen = 1; e.w = b->size == 8; e.opsize16 = b->size == 2; e.reg = b->reg; e.rm = a; encode(&e); return;
+  }
+  {
+    static struct { char *n; int g; } g1[] = {{"add",0},{"or",1},{"and",4},{"sub",5},{"xor",6},{"cmp",7}};
+    for (int i = 0; i < 6; i++) if (!strcmp(mn, g1[i].n)) { if (n != 2) asm_error("bad %s", mn); alu(g1[i].g, a, b, suffix); return; }
+  }
+  if (!strcmp(mn, "test")) {
+    if (n != 2 || a->kind != O_REG) asm_error("bad test");
+    Enc e = {0}; int size = op_size(a, b, suffix); set_size(&e, size, 0x84, 0x85); e.reg = a->reg; e.rm = b; need_rex_for(&e, a); need_rex_for(&e, b); encode(&e); return;
+  }
+  if (!strcmp(mn, "push") || !strcmp(mn, "pop")) {
+    if (n != 1 || a->kind != O_REG || a->size != 8) asm_error("bad %s", mn);
+    if (a->reg >= 8) emit8(0x41);
+    emit8((!strcmp(mn, "push") ? 0x50 : 0x58) + (a->reg & 7)); return;
+  }
+  if (!strcmp(mn, "imul")) {
+    if (n != 2 || b->kind != O_REG) asm_error("bad imul");
+    Enc e = {0}; e.op[0] = 0x0F; e.op[1] = 0xAF; e.oplen = 2; e.w = b->size == 8; e.opsize16 = b->size == 2; e.reg = b->reg; e.rm = a; encode(&e); return;
+  }
+  {
+    static struct { char *n; int g; } g3[] = {{"not",2},{"neg",3},{"mul",4},{"imul",5},{"div",6},{"idiv",7}};
+    for (int i = 0; i < 6; i++) if (!strcmp(mn, g3[i].n)) {
+      if (n != 1) asm_error("bad %s", mn);
+      Enc e = {0}; int size = op_size(a, NULL, suffix); set_size(&e, size, 0xF6, 0xF7); e.reg = g3[i].g; e.rm = a; need_rex_for(&e, a); encode(&e); return;
+    }
+  }
+  if (!strcmp(mn, "inc") || !strcmp(mn, "dec")) {
+    if (n != 1) asm_error("bad %s", mn);
+    Enc e = {0}; int size = op_size(a, NULL, suffix); set_size(&e, size, 0xFE, 0xFF); e.reg = !strcmp(mn, "inc") ? 0 : 1; e.rm = a; need_rex_for(&e, a); encode(&e); return;
+  }
+  {
+    static struct { char *n; int g; } sh[] = {{"shl",4},{"shr",5},{"sar",7},{"sal",4}};
+    for (int i = 0; i < 4; i++) if (!strcmp(mn, sh[i].n)) {
+      Enc e = {0};
+      Op *dst = n == 2 ? b : a;
+      int size = op_size(dst, NULL, suffix);
+      if (n == 2 && a->kind == O_REG && a->reg == 1 && a->size == 1) { set_size(&e, size, 0xD2, 0xD3); e.reg = sh[i].g; e.rm = dst; need_rex_for(&e, dst); encode(&e); return; }
+      if (n == 2 && a->kind == O_IMM) { set_size(&e, size, 0xC0, 0xC1); e.reg = sh[i].g; e.rm = dst; e.imm_size = 1; e.imm = a->imm; need_rex_for(&e, dst); encode(&e); return; }
+      if (n == 1) { set_size(&e, size, 0xD0, 0xD1); e.reg = sh[i].g; e.rm = dst; need_rex_for(&e, dst); encode(&e); return; }
+      asm_error("bad shift");
+    }
+  }
+  if (!strcmp(mn, "xchg") || !strcmp(mn, "cmpxchg")) asm_error("atomics are not supported");
+  asm_error("unknown instruction %s", mn);
+}
+
+static void directive(char *d, char *rest) {
+  if (!strcmp(d, ".text")) { cur = &text; cur_bss = false; return; }
+  if (!strcmp(d, ".data")) { cur = &data; cur_bss = false; return; }
+  if (!strcmp(d, ".bss")) { cur = &data; cur_bss = true; return; }
+  if (!strcmp(d, ".section")) {
+    rest = trim(rest);
+    if (!strncmp(rest, ".text", 5)) { cur = &text; cur_bss = false; return; }
+    if (!strncmp(rest, ".data", 5)) { cur = &data; cur_bss = false; return; }
+    if (!strncmp(rest, ".bss", 4)) { cur = &data; cur_bss = true; return; }
+    asm_error("unsupported section %s (TLS?)", rest);
+  }
+  if (!strcmp(d, ".globl") || !strcmp(d, ".local") || !strcmp(d, ".type") || !strcmp(d, ".size") ||
+      !strcmp(d, ".file") || !strcmp(d, ".loc")) return;
+  if (!strcmp(d, ".align")) {
+    long a = strtol(rest, NULL, 10);
+    if (a <= 0 || (a & (a - 1))) asm_error("bad alignment");
+    if (cur_bss) { bss_len = align_to(bss_len, a); return; }
+    while (cur->len % a) emit8(cur == &text ? 0x90 : 0);
+    return;
+  }
+  if (cur_bss && (!strcmp(d, ".byte") || !strcmp(d, ".quad"))) asm_error("data in .bss");
+  if (!strcmp(d, ".byte")) { long v = strtol(rest, NULL, 10); emit8((int)v & 0xff); return; }
+  if (!strcmp(d, ".zero")) { long v = strtol(rest, NULL, 10); if (cur_bss) bss_len += v; else for (long i = 0; i < v; i++) emit8(0); return; }
+  if (!strcmp(d, ".quad")) {
+    rest = trim(rest);
+    if (isdigit(*rest) || *rest == '-') { emit64((uint64_t)strtoll(rest, NULL, 10)); return; }
+    char *plus = strpbrk(rest, "+-");
+    long addend = 0;
+    if (plus) { addend = strtol(plus, NULL, 10); *plus = 0; }
+    add_fixup(strdup(trim(rest)), addend, true);
+    emit64(0);
+    return;
+  }
+  if (!strcmp(d, ".comm")) {  // .comm name, size, align
+    char *name = strtok(rest, ","); char *sz = strtok(NULL, ","); char *al = strtok(NULL, ",");
+    if (!name || !sz || !al) asm_error("bad .comm");
+    long size = strtol(sz, NULL, 10), a = strtol(al, NULL, 10);
+    bss_len = align_to(bss_len, a);
+    Sym *s = calloc(1, sizeof(Sym)); s->sec = 2; s->off = bss_len;
+    hashmap_put(&syms, strdup(trim(name)), s);
+    bss_len += size;
+    return;
+  }
+  asm_error("unknown directive %s", d);
+}
+
+static void assemble_line(char *line) {
+  cur_line = line;
+  char *s = trim(line);
+  if (!*s) return;
+  // label?
+  size_t L = strlen(s);
+  if (s[L - 1] == ':') {
+    s[L - 1] = 0;
+    if (isdigit(*s) && !s[1]) { int k = ++numeric_count[*s - '0']; define_sym(numeric_name(*s - '0', k)); return; }
+    define_sym(strdup(s));
+    return;
+  }
+  char *sp = s;
+  while (*sp && !isspace(*sp)) sp++;
+  char *rest = *sp ? sp + 1 : sp;
+  *sp = 0;
+  if (*s == '.') directive(s, rest);
+  else if (cur_bss) asm_error("instruction in .bss");
+  else instruction(s, rest);
+}
+
+// ---- ELF ----
+#define BASE 0x400000UL
+#define PAGE 0x1000UL
+
+static void put16(uint8_t *p, uint64_t v) { for (int i = 0; i < 2; i++) p[i] = (v >> (8 * i)) & 0xff; }
+static void put32(uint8_t *p, uint64_t v) { for (int i = 0; i < 4; i++) p[i] = (v >> (8 * i)) & 0xff; }
+static void put64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (v >> (8 * i)) & 0xff; }
+
+void assemble_elf(char *asm_text, FILE *out) {
+  cur = &text; cur_bss = false;
+  char *p = asm_text;
+  line_no = 0;
+  while (*p) {
+    char *nl = strchr(p, '\n');
+    if (nl) *nl = 0;
+    line_no++;
+    // chibicc's cast strings pack several instructions on one line, separated by ';'
+    char *seg = p;
+    while (seg) {
+      char *semi = strchr(seg, ';');
+      if (semi) *semi = 0;
+      assemble_line(seg);
+      seg = semi ? semi + 1 : NULL;
+    }
+    if (!nl) break;
+    p = nl + 1;
+  }
+
+  // layout
+  uint64_t text_off = PAGE, text_addr = BASE + text_off;
+  uint64_t data_off = align_to(text_off + text.len, PAGE), data_addr = BASE + data_off;
+  uint64_t bss_addr = align_to(data_addr + data.len, 16);
+  uint64_t sec_addr[3] = { text_addr, data_addr, bss_addr };
+
+  // resolve fixups
+  for (int i = 0; i < nfixups; i++) {
+    Fixup *f = &fixups[i];
+    Sym *s = hashmap_get(&syms, f->name);
+    if (!s) error("asm: undefined symbol %s", f->name);
+    uint64_t target = sec_addr[s->sec] + s->off + f->addend;
+    Sec *sec = f->sec == 0 ? &text : &data;
+    if (f->abs64) { put64(sec->data + f->off, target); continue; }
+    int64_t rel = (int64_t)target - (int64_t)(sec_addr[f->sec] + f->off);   // addend already includes -4 (and -imm)
+    if (rel < INT32_MIN || rel > INT32_MAX) error("asm: relocation out of range for %s", f->name);
+    put32(sec->data + f->off, (uint32_t)(int32_t)rel);
+  }
+
+  Sym *start = hashmap_get(&syms, "_start");
+  if (!start || start->sec != 0) error("asm: no _start in .text");
+  uint64_t entry = text_addr + start->off;
+
+  uint8_t hdr[64 + 2 * 56] = {0};
+  memcpy(hdr, "\177ELF\2\1\1", 7);
+  put16(hdr + 16, 2); put16(hdr + 18, 62); put32(hdr + 20, 1);
+  put64(hdr + 24, entry); put64(hdr + 32, 64); put64(hdr + 40, 0);
+  put32(hdr + 48, 0); put16(hdr + 52, 64); put16(hdr + 54, 56); put16(hdr + 56, 2);
+  put16(hdr + 58, 64); put16(hdr + 60, 0); put16(hdr + 62, 0);
+  uint8_t *ph = hdr + 64;
+  put32(ph, 1); put32(ph + 4, 5); put64(ph + 8, 0); put64(ph + 16, BASE); put64(ph + 24, BASE);
+  put64(ph + 32, text_off + text.len); put64(ph + 40, text_off + text.len); put64(ph + 48, PAGE);
+  ph += 56;
+  put32(ph, 1); put32(ph + 4, 6); put64(ph + 8, data_off); put64(ph + 16, data_addr); put64(ph + 24, data_addr);
+  put64(ph + 32, data.len); put64(ph + 40, (bss_addr - data_addr) + bss_len); put64(ph + 48, PAGE);
+
+  fwrite(hdr, 1, sizeof hdr, out);
+  for (uint64_t i = sizeof hdr; i < text_off; i++) fputc(0, out);
+  fwrite(text.data, 1, text.len, out);
+  for (uint64_t i = text_off + text.len; i < data_off; i++) fputc(0, out);
+  fwrite(data.data, 1, data.len, out);
+}
+
+exec
+/bin/bash -lc "nl -ba cc/asm.c | sed -n '180,760p'; rg -n \"mx86|set_target_lp64|va_area|asm|fcommon|__chibicc__|long double|struct\" cc/main.c cc/type.c cc/parse.c cc/preprocess.c host/main.c; diff -u /home/exedev/src/chibicc/codegen.c cc/codegen_x86.c || true" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+   180	    int r = e->reg & 7;
+   181	    if (e->rm->kind == O_REG) {
+   182	      emit8(0xC0 | (r << 3) | (e->rm->reg & 7));
+   183	    } else if (e->rm->base == -1) {
+   184	      emit8((r << 3) | 5);
+   185	      add_fixup(e->rm->sym, e->rm->disp - 4 - e->imm_size, false);
+   186	      emit32(0);
+   187	    } else {
+   188	      int b = e->rm->base & 7;
+   189	      int64_t d = e->rm->disp;
+   190	      int mod = (d == 0 && b != 5) ? 0 : (d >= -128 && d <= 127) ? 1 : 2;
+   191	      emit8((mod << 6) | (r << 3) | b);
+   192	      if (b == 4) emit8(0x24); // SIB for rsp/r12 base
+   193	      if (mod == 1) emit8((int)d & 0xff);
+   194	      else if (mod == 2) { if (d < INT32_MIN || d > INT32_MAX) asm_error("displacement out of range"); emit32((uint32_t)d); }
+   195	    }
+   196	  }
+   197	  switch (e->imm_size) {
+   198	  case 0: break;
+   199	  case 1: emit8((int)e->imm & 0xff); break;
+   200	  case 2: emit8(e->imm & 0xff); emit8((e->imm >> 8) & 0xff); break;
+   201	  case 4: emit32((uint32_t)e->imm); break;
+   202	  case 8: emit64((uint64_t)e->imm); break;
+   203	  }
+   204	}
+   205	
+   206	static bool fits8(int64_t v) { return v >= -128 && v <= 127; }
+   207	static bool fits32(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
+   208	
+   209	static int op_size(Op *a, Op *b, char suffix) {
+   210	  if (a && a->kind == O_REG && !a->xmm) return a->size;
+   211	  if (b && b->kind == O_REG && !b->xmm) return b->size;
+   212	  switch (suffix) { case 'b': return 1; case 'w': return 2; case 'l': return 4; case 'q': return 8; }
+   213	  asm_error("cannot determine operand size");
+   214	}
+   215	
+   216	static void set_size(Enc *e, int size, uint8_t op8, uint8_t op) {
+   217	  e->op[0] = size == 1 ? op8 : op; e->oplen = 1;
+   218	  e->w = size == 8; e->opsize16 = size == 2;
+   219	}
+   220	
+   221	static void need_rex_for(Enc *e, Op *r) {
+   222	  if (r && r->kind == O_REG && r->size == 1 && !r->high8 && r->reg >= 4 && r->reg <= 7) e->need_rex = true;
+   223	}
+   224	
+   225	// group-1 ALU: add=0 or=1 and=4 sub=5 xor=6 cmp=7
+   226	static void alu(int n, Op *src, Op *dst, char suffix) {
+   227	  Enc e = {0};
+   228	  int size = op_size(dst, src, suffix);
+   229	  if (src->kind == O_IMM) {
+   230	    if (dst->kind != O_REG && dst->kind != O_MEM) asm_error("bad ALU destination");
+   231	    e.rm = dst; e.reg = n;
+   232	    if (size == 1) { e.op[0] = 0x80; e.imm_size = 1; }
+   233	    else if (fits8(src->imm)) { e.op[0] = 0x83; e.imm_size = 1; }
+   234	    else { e.op[0] = 0x81; e.imm_size = size == 2 ? 2 : 4; if (!fits32(src->imm)) asm_error("immediate too large"); }
+   235	    e.oplen = 1; e.w = size == 8; e.opsize16 = size == 2; e.imm = src->imm;
+   236	    need_rex_for(&e, dst);
+   237	    encode(&e);
+   238	    return;
+   239	  }
+   240	  if (src->kind == O_REG && (dst->kind == O_REG || dst->kind == O_MEM)) {  // op r, r/m  (r is source)
+   241	    set_size(&e, size, n * 8, n * 8 + 1); e.reg = src->reg; e.rm = dst;
+   242	    need_rex_for(&e, src); need_rex_for(&e, dst);
+   243	    encode(&e);
+   244	    return;
+   245	  }
+   246	  if (src->kind == O_MEM && dst->kind == O_REG) {  // op r/m, r
+   247	    set_size(&e, size, n * 8 + 2, n * 8 + 3); e.reg = dst->reg; e.rm = src;
+   248	    need_rex_for(&e, dst);
+   249	    encode(&e);
+   250	    return;
+   251	  }
+   252	  asm_error("unsupported ALU operands");
+   253	}
+   254	
+   255	static void mov(Op *src, Op *dst, char suffix) {
+   256	  Enc e = {0};
+   257	  if ((src->kind == O_REG && src->xmm) || (dst->kind == O_REG && dst->xmm)) asm_error("use movq/movss/movsd for xmm");
+   258	  int size = op_size(dst, src, suffix);
+   259	  if (src->kind == O_IMM) {
+   260	    if (dst->kind == O_REG) {
+   261	      if (size == 8 && !fits32(src->imm)) { e.w = true; e.op[0] = 0xB8 + (dst->reg & 7); e.oplen = 1; e.imm_size = 8; e.imm = src->imm; if (dst->reg >= 8) { e.rm = NULL; e.reg = 0; /* REX.B via manual */ }
+   262	        // manual REX for the B8+r form
+   263	        emit8(0x48 | (dst->reg >= 8 ? 1 : 0)); emit8(0xB8 + (dst->reg & 7)); emit64((uint64_t)src->imm); return; }
+   264	      if (size == 8) { e.w = true; e.op[0] = 0xC7; e.oplen = 1; e.reg = 0; e.rm = dst; e.imm_size = 4; e.imm = src->imm; encode(&e); return; }
+   265	      // B0+r / B8+r
+   266	      if (size == 1) { if (!fits8(src->imm) && src->imm > 255) asm_error("immediate too large"); }
+   267	      if (size == 2) e.opsize16 = true;
+   268	      int rex = 0x40 | (dst->reg >= 8 ? 1 : 0);
+   269	      if (rex != 0x40 || (size == 1 && dst->reg >= 4 && dst->reg <= 7 && !dst->high8)) emit8(rex);
+   270	      if (e.opsize16) emit8(0x66);
+   271	      emit8((size == 1 ? 0xB0 : 0xB8) + (dst->reg & 7));
+   272	      if (size == 1) emit8(src->imm & 0xff); else if (size == 2) { emit8(src->imm & 0xff); emit8((src->imm >> 8) & 0xff); } else emit32((uint32_t)src->imm);
+   273	      return;
+   274	    }
+   275	    if (dst->kind == O_MEM) {
+   276	      set_size(&e, size, 0xC6, 0xC7); e.reg = 0; e.rm = dst; e.imm_size = size == 8 ? 4 : size == 2 ? 2 : size; e.imm = src->imm;
+   277	      if (size == 8 && !fits32(src->imm)) asm_error("immediate too large for memory store");
+   278	      encode(&e); return;
+   279	    }
+   280	  }
+   281	  if (src->kind == O_REG && (dst->kind == O_REG || dst->kind == O_MEM)) {
+   282	    set_size(&e, size, 0x88, 0x89); e.reg = src->reg; e.rm = dst; need_rex_for(&e, src); need_rex_for(&e, dst); encode(&e); return;
+   283	  }
+   284	  if (src->kind == O_MEM && dst->kind == O_REG) {
+   285	    if (src->gotpcrel) { if (size != 8) asm_error("GOTPCREL load into a non-64-bit register"); e.op[0] = 0x8D; e.oplen = 1; e.w = true; e.reg = dst->reg; e.rm = src; encode(&e); return; }
+   286	    set_size(&e, size, 0x8A, 0x8B); e.reg = dst->reg; e.rm = src; need_rex_for(&e, dst); encode(&e); return;
+   287	  }
+   288	  asm_error("unsupported mov operands");
+   289	}
+   290	
+   291	// movs*/movz* family: mnemonic gives sign and source width; destination width from register
+   292	static void movx(char *mn, Op *src, Op *dst) {
+   293	  bool sign = mn[3] == 's';
+   294	  int srcsize;
+   295	  char *rest = mn + 4;   // after "movs"/"movz"
+   296	  if (!strcmp(mn, "movsxd") || !strcmp(mn, "movslq")) srcsize = 4;
+   297	  else if (*rest == 'b') srcsize = 1;
+   298	  else if (*rest == 'w') srcsize = 2;
+   299	  else if (*rest == 'x' || *rest == 0) { // movzx / movzb without suffix: source size from register
+   300	    if (src->kind != O_REG) asm_error("%s needs a register source", mn); srcsize = src->size;
+   301	  } else asm_error("unknown extension %s", mn);
+   302	  if (dst->kind != O_REG) asm_error("%s needs a register destination", mn);
+   303	  Enc e = {0};
+   304	  if (srcsize == 4) { e.w = true; e.op[0] = 0x63; e.oplen = 1; }
+   305	  else { e.op[0] = 0x0F; e.op[1] = (sign ? 0xBE : 0xB6) + (srcsize == 2 ? 1 : 0); e.oplen = 2; e.w = dst->size == 8; e.opsize16 = dst->size == 2; }
+   306	  e.reg = dst->reg; e.rm = src; need_rex_for(&e, src);
+   307	  encode(&e);
+   308	}
+   309	
+   310	static int cc_code(char *s) {
+   311	  static struct { char *n; int c; } t[] = {
+   312	    {"o",0},{"no",1},{"b",2},{"c",2},{"nae",2},{"ae",3},{"nb",3},{"e",4},{"z",4},{"ne",5},{"nz",5},{"be",6},{"na",6},
+   313	    {"a",7},{"nbe",7},{"s",8},{"ns",9},{"p",10},{"np",11},{"l",12},{"ge",13},{"le",14},{"g",15},
+   314	  };
+   315	  for (int i = 0; i < sizeof(t) / sizeof(*t); i++) if (!strcmp(t[i].n, s)) return t[i].c;
+   316	  return -1;
+   317	}
+   318	
+   319	static void sse(int prefix, uint8_t op, Op *src, Op *dst, bool w, bool xmm_in_reg_field_is_dst) {
+   320	  // generic "op xmm/m, xmm" form: reg field = dst xmm, rm = src
+   321	  Enc e = {0};
+   322	  e.prefix = prefix; e.op[0] = 0x0F; e.op[1] = op; e.oplen = 2; e.w = w;
+   323	  if (xmm_in_reg_field_is_dst) { e.reg = dst->reg; e.rm = src; }
+   324	  else { e.reg = src->reg; e.rm = dst; }
+   325	  encode(&e);
+   326	}
+   327	
+   328	static void instruction(char *mn, char *rest) {
+   329	  Op ops[3]; int n = 0;
+   330	  if (rest && *rest) {
+   331	    char *p = rest;
+   332	    while (n < 3) {
+   333	      char *comma = strchr(p, ',');
+   334	      if (comma) *comma = 0;
+   335	      ops[n++] = parse_op(p);
+   336	      if (!comma) break;
+   337	      p = comma + 1;
+   338	    }
+   339	  }
+   340	  Op *a = n > 0 ? &ops[0] : NULL, *b = n > 1 ? &ops[1] : NULL;
+   341	  size_t L = strlen(mn);
+   342	  char suffix = 0;
+   343	
+   344	  // prefixes
+   345	  if (!strcmp(mn, "rep")) {
+   346	    if (!strcmp(trim(rest), "stosb")) { emit8(0xF3); emit8(0xAA); return; }
+   347	    asm_error("unsupported rep instruction");
+   348	  }
+   349	  if (!strcmp(mn, "lock") || !strcmp(mn, "data16") || !strcmp(mn, "rex64")) asm_error("atomics/TLS are not supported");
+   350	
+   351	  // no-operand instructions
+   352	  if (n == 0) {
+   353	    if (!strcmp(mn, "ret")) { emit8(0xC3); return; }
+   354	    if (!strcmp(mn, "cqo") || !strcmp(mn, "cqto")) { emit8(0x48); emit8(0x99); return; }
+   355	    if (!strcmp(mn, "cdq") || !strcmp(mn, "cltd")) { emit8(0x99); return; }
+   356	    if (!strcmp(mn, "syscall")) { emit8(0x0F); emit8(0x05); return; }
+   357	    if (!strcmp(mn, "hlt")) { emit8(0xF4); return; }
+   358	    if (!strcmp(mn, "nop")) { emit8(0x90); return; }
+   359	    if (mn[0] == 'f') asm_error("x87 (long double) is not supported");
+   360	    asm_error("unknown instruction %s", mn);
+   361	  }
+   362	
+   363	  // control flow
+   364	  if (!strcmp(mn, "jmp") || !strcmp(mn, "call")) {
+   365	    if (a->kind == O_LABEL) { emit8(!strcmp(mn, "jmp") ? 0xE9 : 0xE8); add_fixup(a->sym, -4, false); emit32(0); return; }
+   366	    if (a->kind == O_REG && a->size == 8) { Enc e = {0}; e.op[0] = 0xFF; e.oplen = 1; e.reg = !strcmp(mn, "jmp") ? 4 : 2; e.rm = a; encode(&e); return; }
+   367	    asm_error("bad %s operand", mn);
+   368	  }
+   369	  if (mn[0] == 'j' && a->kind == O_LABEL) {
+   370	    int cc = cc_code(mn + 1);
+   371	    if (cc < 0) asm_error("unknown jump %s", mn);
+   372	    emit8(0x0F); emit8(0x80 + cc); add_fixup(a->sym, -4, false); emit32(0); return;
+   373	  }
+   374	  if (!strncmp(mn, "set", 3) && n == 1) {
+   375	    int cc = cc_code(mn + 3);
+   376	    if (cc < 0 || a->kind != O_REG || a->size != 1) asm_error("bad setcc");
+   377	    Enc e = {0}; e.op[0] = 0x0F; e.op[1] = 0x90 + cc; e.oplen = 2; e.reg = 0; e.rm = a; need_rex_for(&e, a); encode(&e); return;
+   378	  }
+   379	
+   380	  // SSE
+   381	  if (!strcmp(mn, "movss") || !strcmp(mn, "movsd")) {
+   382	    int pfx = mn[4] == 's' ? 0xF3 : 0xF2;
+   383	    if (b->kind == O_REG && b->xmm) { sse(pfx, 0x10, a, b, false, true); return; }       // load / reg-reg
+   384	    if (a->kind == O_REG && a->xmm && b->kind == O_MEM) { sse(pfx, 0x11, a, b, false, false); return; } // store
+   385	    asm_error("bad %s operands", mn);
+   386	  }
+   387	  if (!strcmp(mn, "movq") && ((a->kind == O_REG && a->xmm) || (b->kind == O_REG && b->xmm))) {
+   388	    if (b->xmm) { Enc e = {0}; e.prefix = 0x66; e.w = true; e.op[0] = 0x0F; e.op[1] = 0x6E; e.oplen = 2; e.reg = b->reg; e.rm = a; encode(&e); return; }
+   389	    Enc e = {0}; e.prefix = 0x66; e.w = true; e.op[0] = 0x0F; e.op[1] = 0x7E; e.oplen = 2; e.reg = a->reg; e.rm = b; encode(&e); return;
+   390	  }
+   391	  if (!strncmp(mn, "cvtsi2s", 7)) {  // cvtsi2ss[lq] / cvtsi2sd[lq]: int -> float
+   392	    int pfx = mn[7] == 's' ? 0xF3 : 0xF2;
+   393	    bool w = mn[8] == 'q' || (mn[8] == 0 && a->kind == O_REG && a->size == 8);
+   394	    sse(pfx, 0x2A, a, b, w, true); return;
+   395	  }
+   396	  if (!strncmp(mn, "cvtts", 5)) {    // cvttss2si[lq] / cvttsd2si[lq]: float -> int
+   397	    int pfx = mn[5] == 's' ? 0xF3 : 0xF2;
+   398	    bool w = b->size == 8;
+   399	    Enc e = {0}; e.prefix = pfx; e.op[0] = 0x0F; e.op[1] = 0x2C; e.oplen = 2; e.w = w; e.reg = b->reg; e.rm = a; encode(&e); return;
+   400	  }
+   401	  if (!strcmp(mn, "cvtss2sd")) { sse(0xF3, 0x5A, a, b, false, true); return; }
+   402	  if (!strcmp(mn, "cvtsd2ss")) { sse(0xF2, 0x5A, a, b, false, true); return; }
+   403	  if (!strcmp(mn, "ucomiss")) { sse(0, 0x2E, a, b, false, true); return; }
+   404	  if (!strcmp(mn, "ucomisd")) { sse(0x66, 0x2E, a, b, false, true); return; }
+   405	  if (!strcmp(mn, "xorps")) { sse(0, 0x57, a, b, false, true); return; }
+   406	  if (!strcmp(mn, "xorpd")) { sse(0x66, 0x57, a, b, false, true); return; }
+   407	  if (!strcmp(mn, "pxor")) { sse(0x66, 0xEF, a, b, false, true); return; }
+   408	  {
+   409	    static struct { char *n; int op; } arith[] = {{"add",0x58},{"mul",0x59},{"sub",0x5C},{"div",0x5E}};
+   410	    for (int i = 0; i < 4; i++)
+   411	      if (!strncmp(mn, arith[i].n, 3) && L == 5 && mn[3] == 's' && (mn[4] == 's' || mn[4] == 'd')) {
+   412	        sse(mn[4] == 's' ? 0xF3 : 0xF2, arith[i].op, a, b, false, true); return;
+   413	      }
+   414	  }
+   415	  if (mn[0] == 'f') asm_error("x87 (long double) is not supported");
+   416	
+   417	  // movs*/movz*
+   418	  if (!strncmp(mn, "movs", 4) || !strncmp(mn, "movz", 4)) {
+   419	    if (n != 2) asm_error("bad %s", mn);
+   420	    if (!strcmp(mn, "movsd") || !strcmp(mn, "movss")) asm_error("unreachable");
+   421	    movx(mn, a, b); return;
+   422	  }
+   423	
+   424	  // integer mov / alu with optional size suffix
+   425	  char stem[16];
+   426	  strcpy(stem, mn);
+   427	  if (L > 3 && strchr("bwlq", mn[L - 1]) && (!strncmp(mn, "mov", 3) || !strncmp(mn, "add", 3) || !strncmp(mn, "sub", 3) ||
+   428	      !strncmp(mn, "and", 3) || !strncmp(mn, "cmp", 3) || !strncmp(mn, "xor", 3) || !strncmp(mn, "or", 2) ||
+   429	      !strncmp(mn, "test", 4) || !strncmp(mn, "imul", 4) || !strncmp(mn, "idiv", 4) || !strncmp(mn, "div", 3) ||
+   430	      !strncmp(mn, "neg", 3) || !strncmp(mn, "not", 3) || !strncmp(mn, "shl", 3) || !strncmp(mn, "shr", 3) || !strncmp(mn, "sar", 3) ||
+   431	      !strncmp(mn, "push", 4) || !strncmp(mn, "pop", 3) || !strncmp(mn, "lea", 3) || !strncmp(mn, "inc", 3) || !strncmp(mn, "dec", 3))) {
+   432	    if (strcmp(mn, "mul") && strcmp(mn, "shl") && strcmp(mn, "shr") && strcmp(mn, "sarl") ) {
+   433	      // only strip when the stem is a known mnemonic (avoid "mul"->"mu")
+   434	      static char *stems[] = {"mov","add","sub","and","cmp","xor","or","test","imul","idiv","div","neg","not","shl","shr","sar","push","pop","lea","inc","dec"};
+   435	      for (int i = 0; i < sizeof(stems) / sizeof(*stems); i++)
+   436	        if (strlen(stems[i]) == L - 1 && !strncmp(mn, stems[i], L - 1)) { suffix = mn[L - 1]; stem[L - 1] = 0; break; }
+   437	    }
+   438	  }
+   439	  mn = stem;
+   440	
+   441	  if (!strcmp(mn, "mov")) { if (n != 2) asm_error("bad mov"); mov(a, b, suffix); return; }
+   442	  if (!strcmp(mn, "lea")) {
+   443	    if (n != 2 || a->kind != O_MEM || b->kind != O_REG) asm_error("bad lea");
+   444	    Enc e = {0}; e.op[0] = 0x8D; e.oplen = 1; e.w = b->size == 8; e.opsize16 = b->size == 2; e.reg = b->reg; e.rm = a; encode(&e); return;
+   445	  }
+   446	  {
+   447	    static struct { char *n; int g; } g1[] = {{"add",0},{"or",1},{"and",4},{"sub",5},{"xor",6},{"cmp",7}};
+   448	    for (int i = 0; i < 6; i++) if (!strcmp(mn, g1[i].n)) { if (n != 2) asm_error("bad %s", mn); alu(g1[i].g, a, b, suffix); return; }
+   449	  }
+   450	  if (!strcmp(mn, "test")) {
+   451	    if (n != 2 || a->kind != O_REG) asm_error("bad test");
+   452	    Enc e = {0}; int size = op_size(a, b, suffix); set_size(&e, size, 0x84, 0x85); e.reg = a->reg; e.rm = b; need_rex_for(&e, a); need_rex_for(&e, b); encode(&e); return;
+   453	  }
+   454	  if (!strcmp(mn, "push") || !strcmp(mn, "pop")) {
+   455	    if (n != 1 || a->kind != O_REG || a->size != 8) asm_error("bad %s", mn);
+   456	    if (a->reg >= 8) emit8(0x41);
+   457	    emit8((!strcmp(mn, "push") ? 0x50 : 0x58) + (a->reg & 7)); return;
+   458	  }
+   459	  if (!strcmp(mn, "imul")) {
+   460	    if (n != 2 || b->kind != O_REG) asm_error("bad imul");
+   461	    Enc e = {0}; e.op[0] = 0x0F; e.op[1] = 0xAF; e.oplen = 2; e.w = b->size == 8; e.opsize16 = b->size == 2; e.reg = b->reg; e.rm = a; encode(&e); return;
+   462	  }
+   463	  {
+   464	    static struct { char *n; int g; } g3[] = {{"not",2},{"neg",3},{"mul",4},{"imul",5},{"div",6},{"idiv",7}};
+   465	    for (int i = 0; i < 6; i++) if (!strcmp(mn, g3[i].n)) {
+   466	      if (n != 1) asm_error("bad %s", mn);
+   467	      Enc e = {0}; int size = op_size(a, NULL, suffix); set_size(&e, size, 0xF6, 0xF7); e.reg = g3[i].g; e.rm = a; need_rex_for(&e, a); encode(&e); return;
+   468	    }
+   469	  }
+   470	  if (!strcmp(mn, "inc") || !strcmp(mn, "dec")) {
+   471	    if (n != 1) asm_error("bad %s", mn);
+   472	    Enc e = {0}; int size = op_size(a, NULL, suffix); set_size(&e, size, 0xFE, 0xFF); e.reg = !strcmp(mn, "inc") ? 0 : 1; e.rm = a; need_rex_for(&e, a); encode(&e); return;
+   473	  }
+   474	  {
+   475	    static struct { char *n; int g; } sh[] = {{"shl",4},{"shr",5},{"sar",7},{"sal",4}};
+   476	    for (int i = 0; i < 4; i++) if (!strcmp(mn, sh[i].n)) {
+   477	      Enc e = {0};
+   478	      Op *dst = n == 2 ? b : a;
+   479	      int size = op_size(dst, NULL, suffix);
+   480	      if (n == 2 && a->kind == O_REG && a->reg == 1 && a->size == 1) { set_size(&e, size, 0xD2, 0xD3); e.reg = sh[i].g; e.rm = dst; need_rex_for(&e, dst); encode(&e); return; }
+   481	      if (n == 2 && a->kind == O_IMM) { set_size(&e, size, 0xC0, 0xC1); e.reg = sh[i].g; e.rm = dst; e.imm_size = 1; e.imm = a->imm; need_rex_for(&e, dst); encode(&e); return; }
+   482	      if (n == 1) { set_size(&e, size, 0xD0, 0xD1); e.reg = sh[i].g; e.rm = dst; need_rex_for(&e, dst); encode(&e); return; }
+   483	      asm_error("bad shift");
+   484	    }
+   485	  }
+   486	  if (!strcmp(mn, "xchg") || !strcmp(mn, "cmpxchg")) asm_error("atomics are not supported");
+   487	  asm_error("unknown instruction %s", mn);
+   488	}
+   489	
+   490	static void directive(char *d, char *rest) {
+   491	  if (!strcmp(d, ".text")) { cur = &text; cur_bss = false; return; }
+   492	  if (!strcmp(d, ".data")) { cur = &data; cur_bss = false; return; }
+   493	  if (!strcmp(d, ".bss")) { cur = &data; cur_bss = true; return; }
+   494	  if (!strcmp(d, ".section")) {
+   495	    rest = trim(rest);
+   496	    if (!strncmp(rest, ".text", 5)) { cur = &text; cur_bss = false; return; }
+   497	    if (!strncmp(rest, ".data", 5)) { cur = &data; cur_bss = false; return; }
+   498	    if (!strncmp(rest, ".bss", 4)) { cur = &data; cur_bss = true; return; }
+   499	    asm_error("unsupported section %s (TLS?)", rest);
+   500	  }
+   501	  if (!strcmp(d, ".globl") || !strcmp(d, ".local") || !strcmp(d, ".type") || !strcmp(d, ".size") ||
+   502	      !strcmp(d, ".file") || !strcmp(d, ".loc")) return;
+   503	  if (!strcmp(d, ".align")) {
+   504	    long a = strtol(rest, NULL, 10);
+   505	    if (a <= 0 || (a & (a - 1))) asm_error("bad alignment");
+   506	    if (cur_bss) { bss_len = align_to(bss_len, a); return; }
+   507	    while (cur->len % a) emit8(cur == &text ? 0x90 : 0);
+   508	    return;
+   509	  }
+   510	  if (cur_bss && (!strcmp(d, ".byte") || !strcmp(d, ".quad"))) asm_error("data in .bss");
+   511	  if (!strcmp(d, ".byte")) { long v = strtol(rest, NULL, 10); emit8((int)v & 0xff); return; }
+   512	  if (!strcmp(d, ".zero")) { long v = strtol(rest, NULL, 10); if (cur_bss) bss_len += v; else for (long i = 0; i < v; i++) emit8(0); return; }
+   513	  if (!strcmp(d, ".quad")) {
+   514	    rest = trim(rest);
+   515	    if (isdigit(*rest) || *rest == '-') { emit64((uint64_t)strtoll(rest, NULL, 10)); return; }
+   516	    char *plus = strpbrk(rest, "+-");
+   517	    long addend = 0;
+   518	    if (plus) { addend = strtol(plus, NULL, 10); *plus = 0; }
+   519	    add_fixup(strdup(trim(rest)), addend, true);
+   520	    emit64(0);
+   521	    return;
+   522	  }
+   523	  if (!strcmp(d, ".comm")) {  // .comm name, size, align
+   524	    char *name = strtok(rest, ","); char *sz = strtok(NULL, ","); char *al = strtok(NULL, ",");
+   525	    if (!name || !sz || !al) asm_error("bad .comm");
+   526	    long size = strtol(sz, NULL, 10), a = strtol(al, NULL, 10);
+   527	    bss_len = align_to(bss_len, a);
+   528	    Sym *s = calloc(1, sizeof(Sym)); s->sec = 2; s->off = bss_len;
+   529	    hashmap_put(&syms, strdup(trim(name)), s);
+   530	    bss_len += size;
+   531	    return;
+   532	  }
+   533	  asm_error("unknown directive %s", d);
+   534	}
+   535	
+   536	static void assemble_line(char *line) {
+   537	  cur_line = line;
+   538	  char *s = trim(line);
+   539	  if (!*s) return;
+   540	  // label?
+   541	  size_t L = strlen(s);
+   542	  if (s[L - 1] == ':') {
+   543	    s[L - 1] = 0;
+   544	    if (isdigit(*s) && !s[1]) { int k = ++numeric_count[*s - '0']; define_sym(numeric_name(*s - '0', k)); return; }
+   545	    define_sym(strdup(s));
+   546	    return;
+   547	  }
+   548	  char *sp = s;
+   549	  while (*sp && !isspace(*sp)) sp++;
+   550	  char *rest = *sp ? sp + 1 : sp;
+   551	  *sp = 0;
+   552	  if (*s == '.') directive(s, rest);
+   553	  else if (cur_bss) asm_error("instruction in .bss");
+   554	  else instruction(s, rest);
+   555	}
+   556	
+   557	// ---- ELF ----
+   558	#define BASE 0x400000UL
+   559	#define PAGE 0x1000UL
+   560	
+   561	static void put16(uint8_t *p, uint64_t v) { for (int i = 0; i < 2; i++) p[i] = (v >> (8 * i)) & 0xff; }
+   562	static void put32(uint8_t *p, uint64_t v) { for (int i = 0; i < 4; i++) p[i] = (v >> (8 * i)) & 0xff; }
+   563	static void put64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (v >> (8 * i)) & 0xff; }
+   564	
+   565	void assemble_elf(char *asm_text, FILE *out) {
+   566	  cur = &text; cur_bss = false;
+   567	  char *p = asm_text;
+   568	  line_no = 0;
+   569	  while (*p) {
+   570	    char *nl = strchr(p, '\n');
+   571	    if (nl) *nl = 0;
+   572	    line_no++;
+   573	    // chibicc's cast strings pack several instructions on one line, separated by ';'
+   574	    char *seg = p;
+   575	    while (seg) {
+   576	      char *semi = strchr(seg, ';');
+   577	      if (semi) *semi = 0;
+   578	      assemble_line(seg);
+   579	      seg = semi ? semi + 1 : NULL;
+   580	    }
+   581	    if (!nl) break;
+   582	    p = nl + 1;
+   583	  }
+   584	
+   585	  // layout
+   586	  uint64_t text_off = PAGE, text_addr = BASE + text_off;
+   587	  uint64_t data_off = align_to(text_off + text.len, PAGE), data_addr = BASE + data_off;
+   588	  uint64_t bss_addr = align_to(data_addr + data.len, 16);
+   589	  uint64_t sec_addr[3] = { text_addr, data_addr, bss_addr };
+   590	
+   591	  // resolve fixups
+   592	  for (int i = 0; i < nfixups; i++) {
+   593	    Fixup *f = &fixups[i];
+   594	    Sym *s = hashmap_get(&syms, f->name);
+   595	    if (!s) error("asm: undefined symbol %s", f->name);
+   596	    uint64_t target = sec_addr[s->sec] + s->off + f->addend;
+   597	    Sec *sec = f->sec == 0 ? &text : &data;
+   598	    if (f->abs64) { put64(sec->data + f->off, target); continue; }
+   599	    int64_t rel = (int64_t)target - (int64_t)(sec_addr[f->sec] + f->off);   // addend already includes -4 (and -imm)
+   600	    if (rel < INT32_MIN || rel > INT32_MAX) error("asm: relocation out of range for %s", f->name);
+   601	    put32(sec->data + f->off, (uint32_t)(int32_t)rel);
+   602	  }
+   603	
+   604	  Sym *start = hashmap_get(&syms, "_start");
+   605	  if (!start || start->sec != 0) error("asm: no _start in .text");
+   606	  uint64_t entry = text_addr + start->off;
+   607	
+   608	  uint8_t hdr[64 + 2 * 56] = {0};
+   609	  memcpy(hdr, "\177ELF\2\1\1", 7);
+   610	  put16(hdr + 16, 2); put16(hdr + 18, 62); put32(hdr + 20, 1);
+   611	  put64(hdr + 24, entry); put64(hdr + 32, 64); put64(hdr + 40, 0);
+   612	  put32(hdr + 48, 0); put16(hdr + 52, 64); put16(hdr + 54, 56); put16(hdr + 56, 2);
+   613	  put16(hdr + 58, 64); put16(hdr + 60, 0); put16(hdr + 62, 0);
+   614	  uint8_t *ph = hdr + 64;
+   615	  put32(ph, 1); put32(ph + 4, 5); put64(ph + 8, 0); put64(ph + 16, BASE); put64(ph + 24, BASE);
+   616	  put64(ph + 32, text_off + text.len); put64(ph + 40, text_off + text.len); put64(ph + 48, PAGE);
+   617	  ph += 56;
+   618	  put32(ph, 1); put32(ph + 4, 6); put64(ph + 8, data_off); put64(ph + 16, data_addr); put64(ph + 24, data_addr);
+   619	  put64(ph + 32, data.len); put64(ph + 40, (bss_addr - data_addr) + bss_len); put64(ph + 48, PAGE);
+   620	
+   621	  fwrite(hdr, 1, sizeof hdr, out);
+   622	  for (uint64_t i = sizeof hdr; i < text_off; i++) fputc(0, out);
+   623	  fwrite(text.data, 1, text.len, out);
+   624	  for (uint64_t i = text_off + text.len; i < data_off; i++) fputc(0, out);
+   625	  fwrite(data.data, 1, data.len, out);
+   626	}
+host/main.c:12:U8 wasm_arena[(unsigned long)ARENA_PAGES * WASM_PAGE_SIZE];
+host/main.c:13:const U32 wasm_arena_pages = ARENA_PAGES;
+host/main.c:14:wasmFunc wasm_table_arena[TABLE_SIZE];
+host/main.c:15:U32 wasm_table_types_arena[TABLE_SIZE];
+host/main.c:16:const U32 wasm_table_arena_size = TABLE_SIZE;
+host/main.c:20:#ifdef __chibicc__
+host/main.c:21:/* chibicc has no operand constraints: the syscall stub is a plain asm function */
+host/main.c:23:__asm__(".globl sys3\nsys3:\n mov %rdi, %rax\n mov %rsi, %rdi\n mov %rdx, %rsi\n mov %rcx, %rdx\n syscall\n ret\n");
+host/main.c:27:    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
+host/main.c:50:static wasmMemory* mem(void* i) { return ((guestInstance*)i)->m0; }
+host/main.c:55:    wasm_check(mem(i), ptr, len);
+host/main.c:63:    wasm_check(mem(i), ptr, len);
+host/main.c:79:__asm__(".globl _start\n_start:\n xor %rbp,%rbp\n call cmain\n hlt\n");
+cc/type.c:24:// x86-64 target: long and pointers are 8 bytes, long double is the 16-byte x87 type
+cc/type.c:25:void set_target_lp64(void) {
+cc/type.c:142:Type *struct_type(void) {
+cc/main.c:1:// Driver for the wasm backend: one translation unit in, one .wasm out.
+cc/main.c:6:bool opt_fcommon = false;
+cc/main.c:16:  struct stat st;
+cc/main.c:38:  fprintf(stderr, "usage: cc [-E] [-mx86] [-I<dir>] [-D<macro>[=val]] [-mstack=<bytes>] [-mmaxpages=<n>] -o <out> <input.c>\n"
+cc/main.c:39:                  "  default: wasm32 module; -mx86: static x86-64 ELF executable (no libc)\n");
+cc/main.c:54:    if (!strcmp(argv[i], "-mx86")) { opt_x86 = true; continue; }
+cc/main.c:77:  if (opt_x86) set_target_lp64();
+cc/preprocess.c:27:typedef struct MacroParam MacroParam;
+cc/preprocess.c:28:struct MacroParam {
+cc/preprocess.c:33:typedef struct MacroArg MacroArg;
+cc/preprocess.c:34:struct MacroArg {
+cc/preprocess.c:43:typedef struct Macro Macro;
+cc/preprocess.c:44:struct Macro {
+cc/preprocess.c:54:typedef struct CondIncl CondIncl;
+cc/preprocess.c:55:struct CondIncl {
+cc/preprocess.c:62:typedef struct Hideset Hideset;
+cc/preprocess.c:63:struct Hideset {
+cc/preprocess.c:731:    // Reconstruct a filename from a sequence of tokens between
+cc/preprocess.c:1031:  struct stat st;
+cc/preprocess.c:1046:static char *format_date(struct tm *tm) {
+cc/preprocess.c:1056:static char *format_time(struct tm *tm) {
+cc/preprocess.c:1076:    define_macro("__wasm__", "1");
+cc/preprocess.c:1077:    define_macro("__wasm32__", "1");
+cc/preprocess.c:1096:  define_macro("__chibicc__", "1");
+cc/preprocess.c:1110:  struct tm *tm = localtime(&now);
+cc/parse.c:6:// then construct an AST node representing a statement.
+cc/parse.c:23:typedef struct {
+cc/parse.c:31:typedef struct Scope Scope;
+cc/parse.c:32:struct Scope {
+cc/parse.c:36:  // the other is for struct/union/enum tags.
+cc/parse.c:42:typedef struct {
+cc/parse.c:51:// This struct represents a variable initializer. Since initializers
+cc/parse.c:52:// can be nested (e.g. `int x[2][2] = {{1, 2}, {3, 4}}`), this struct
+cc/parse.c:53:// is a tree data structure.
+cc/parse.c:54:typedef struct Initializer Initializer;
+cc/parse.c:55:struct Initializer {
+cc/parse.c:65:  // If it's an initializer for an aggregate type (e.g. array or struct),
+cc/parse.c:75:typedef struct InitDesg InitDesg;
+cc/parse.c:76:struct InitDesg {
+cc/parse.c:118:static void struct_initializer2(Token **rest, Token *tok, Initializer *init, Member *mem);
+cc/parse.c:147:static Member *get_struct_member(Type *ty, Token *tok);
+cc/parse.c:148:static Type *struct_decl(Token **rest, Token *tok);
+cc/parse.c:278:    // Count the number of struct members.
+cc/parse.c:365://             | struct-decl | union-decl | typedef-name
+cc/parse.c:420:        error_tok(tok, "thread-local storage is not supported by the wasm backend");
+cc/parse.c:443:      error_tok(tok, "_Atomic is not supported by the wasm backend");
+cc/parse.c:462:    if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum") ||
+cc/parse.c:467:      if (equal(tok, "struct")) {
+cc/parse.c:468:        ty = struct_decl(&tok, tok->next);
+cc/parse.c:579:    error_tok(tok, "_Atomic is not supported by the wasm backend");
+cc/parse.c:589:  // wasm backend: an empty parameter list means "no parameters", not
+cc/parse.c:760:  // Read a struct tag.
+cc/parse.c:980:// Use `.fieldname` to move the cursor for a struct initializer. E.g.
+cc/parse.c:982://   struct { int a, b, c; } x = { .c=5 };
+cc/parse.c:1003:// struct-designator = "." ident
+cc/parse.c:1004:static Member *struct_designator(Token **rest, Token *tok, Type *ty) {
+cc/parse.c:1011:    // Anonymous struct member
+cc/parse.c:1013:      if (get_struct_member(mem->ty, tok)) {
+cc/parse.c:1020:    // Regular struct member
+cc/parse.c:1027:  error_tok(tok, "struct has no such member");
+cc/parse.c:1047:    Member *mem = struct_designator(&tok, tok, init->ty);
+cc/parse.c:1050:    struct_initializer2(rest, tok, init, mem->next);
+cc/parse.c:1055:    Member *mem = struct_designator(&tok, tok, init->ty);
+cc/parse.c:1062:    error_tok(tok, "field name not in struct or union initializer");
+cc/parse.c:1161:// struct-initializer1 = "{" initializer ("," initializer)* ","? "}"
+cc/parse.c:1162:static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
+cc/parse.c:1174:      mem = struct_designator(&tok, tok, init->ty);
+cc/parse.c:1189:// struct-initializer2 = initializer ("," initializer)*
+cc/parse.c:1190:static void struct_initializer2(Token **rest, Token *tok, Initializer *init, Member *mem) {
+cc/parse.c:1211:  // Unlike structs, union initializers take only one initializer,
+cc/parse.c:1215:    Member *mem = struct_designator(&tok, tok->next, init->ty);
+cc/parse.c:1234://             | struct-initializer | union-initializer
+cc/parse.c:1252:      struct_initializer1(rest, tok, init);
+cc/parse.c:1256:    // A struct can be initialized with another struct. E.g.
+cc/parse.c:1257:    // `struct T x = y;` where y is a variable of type `struct T`.
+cc/parse.c:1266:    struct_initializer2(rest, tok, init, init->ty->members);
+cc/parse.c:1286:static Type *copy_struct_type(Type *ty) {
+cc/parse.c:1306:    ty = copy_struct_type(ty);
+cc/parse.c:1508:      "void", "_Bool", "char", "short", "int", "long", "struct", "union",
+cc/parse.c:1522:// asm-stmt = "asm" ("volatile" | "inline")* "(" string-literal ")"
+cc/parse.c:1523:static Node *asm_stmt(Token **rest, Token *tok) {
+cc/parse.c:1533:  node->asm_str = tok->str;
+cc/parse.c:1546://      | "asm" asm-stmt
+cc/parse.c:1714:  if (equal(tok, "asm"))
+cc/parse.c:1715:    return asm_stmt(rest, tok);
+cc/parse.c:2549:// struct-members = (declspec declarator (","  declarator)* ";")*
+cc/parse.c:2550:static void struct_members(Token **rest, Token *tok, Type *ty) {
+cc/parse.c:2560:    // Anonymous struct member
+cc/parse.c:2571:    // Regular struct members
+cc/parse.c:2584:        error_tok(tok, "bitfields are not supported by the wasm backend");
+cc/parse.c:2638:// struct-union-decl = attribute? ident? ("{" struct-members)?
+cc/parse.c:2639:static Type *struct_union_decl(Token **rest, Token *tok) {
+cc/parse.c:2640:  Type *ty = struct_type();
+cc/parse.c:2664:  // Construct a struct object.
+cc/parse.c:2665:  struct_members(&tok, tok, ty);
+cc/parse.c:2670:    // Otherwise, register the struct type.
+cc/parse.c:2683:// struct-decl = struct-union-decl
+cc/parse.c:2684:static Type *struct_decl(Token **rest, Token *tok) {
+cc/parse.c:2685:  Type *ty = struct_union_decl(rest, tok);
+cc/parse.c:2691:  // Assign offsets within the struct to members.
+cc/parse.c:2722:// union-decl = struct-union-decl
+cc/parse.c:2724:  Type *ty = struct_union_decl(rest, tok);
+cc/parse.c:2743:// Find a struct member by name.
+cc/parse.c:2744:static Member *get_struct_member(Type *ty, Token *tok) {
+cc/parse.c:2746:    // Anonymous struct member
+cc/parse.c:2749:      if (get_struct_member(mem->ty, tok))
+cc/parse.c:2754:    // Regular struct member
+cc/parse.c:2762:// Create a node representing a struct member access, such as foo.bar
+cc/parse.c:2763:// where foo is a struct and bar is a member name.
+cc/parse.c:2765:// C has a feature called "anonymous struct" which allows a struct to
+cc/parse.c:2766:// have another unnamed struct as a member like this:
+cc/parse.c:2768://   struct { struct { int a; }; int b; } x;
+cc/parse.c:2770:// The members of an anonymous struct belong to the outer struct's
+cc/parse.c:2772:// member "a" of the anonymous struct as "x.a".
+cc/parse.c:2774:// This function takes care of anonymous structs.
+cc/parse.c:2775:static Node *struct_ref(Node *node, Token *tok) {
+cc/parse.c:2778:    error_tok(node->tok, "not a struct nor a union");
+cc/parse.c:2783:    Member *mem = get_struct_member(ty, tok);
+cc/parse.c:2850:      node = struct_ref(node, tok->next);
+cc/parse.c:2858:      node = struct_ref(node, tok->next);
+cc/parse.c:2927:  // If a function returns a struct, it is caller's responsibility
+cc/parse.c:3239:  // A buffer for a struct/union return value is passed
+cc/parse.c:3248:    fn->va_area = opt_x86 ? new_lvar("__va_area__", array_of(ty_char, 136))
+cc/parse.c:3249:                          : new_lvar("__va_area__", pointer_to(ty_char));
+cc/parse.c:3344:StringArray toplevel_asm;
+cc/parse.c:3351:    // file-scope asm("...") (used by the no-libc host for _start and the syscall stub)
+cc/parse.c:3352:    if (equal(tok, "asm") || equal(tok, "__asm__")) {
+cc/parse.c:3355:      strarray_push(&toplevel_asm, tok->str);
+--- /home/exedev/src/chibicc/codegen.c	2026-09-04 17:10:36.846273790 +0000
++++ cc/codegen_x86.c	2026-09-04 20:44:56.939091307 +0000
+@@ -3,7 +3,10 @@
+ #define GP_MAX 6
+ #define FP_MAX 8
+ 
+-static FILE *output_file;
++// x86-64 backend: upstream chibicc's codegen, emitting into a buffer that
++// asm.c assembles straight into a static ELF executable.
++static char *asm_buf;
++static size_t asm_len, asm_cap;
+ static int depth;
+ static char *argreg8[] = {"%dil", "%sil", "%dl", "%cl", "%r8b", "%r9b"};
+ static char *argreg16[] = {"%di", "%si", "%dx", "%cx", "%r8w", "%r9w"};
+@@ -17,10 +20,16 @@
+ __attribute__((format(printf, 1, 2)))
+ static void println(char *fmt, ...) {
+   va_list ap;
+-  va_start(ap, fmt);
+-  vfprintf(output_file, fmt, ap);
+-  va_end(ap);
+-  fprintf(output_file, "\n");
++  for (;;) {
++    va_start(ap, fmt);
++    int n = vsnprintf(asm_buf + asm_len, asm_cap - asm_len, fmt, ap);
++    va_end(ap);
++    if (n < 0) error("vsnprintf failed");
++    if (asm_len + n + 2 <= asm_cap) { asm_len += n; asm_buf[asm_len++] = '\n'; asm_buf[asm_len] = 0; return; }
++    asm_cap = asm_cap ? asm_cap * 2 : 1 << 20;
++    if (asm_cap < asm_len + n + 2) asm_cap = asm_len + n + 2;
++    asm_buf = realloc(asm_buf, asm_cap);
++  }
+ }
+ 
+ static int count(void) {
+@@ -52,9 +61,7 @@
+ 
+ // Round up `n` to the nearest multiple of `align`. For instance,
+ // align_to(5, 8) returns 8 and align_to(11, 8) returns 16.
+-int align_to(int n, int align) {
+-  return (n + align - 1) / align * align;
+-}
++// align_to is defined in codegen.c
+ 
+ static char *reg_dx(int sz) {
+   switch (sz) {
+@@ -690,7 +697,6 @@
+ 
+ // Generate code for a given node.
+ static void gen_expr(Node *node) {
+-  println("  .loc %d %d", node->tok->file->file_no, node->tok->line_no);
+ 
+   switch (node->kind) {
+   case ND_NULL_EXPR:
+@@ -1186,7 +1192,6 @@
+ }
+ 
+ static void gen_stmt(Node *node) {
+-  println("  .loc %d %d", node->tok->file->file_no, node->tok->line_no);
+ 
+   switch (node->kind) {
+   case ND_IF: {
+@@ -1582,14 +1587,13 @@
+   }
+ }
+ 
+-void codegen(Obj *prog, FILE *out) {
+-  output_file = out;
+-
+-  File **files = get_input_files();
+-  for (int i = 0; files[i]; i++)
+-    println("  .file %d \"%s\"", files[i]->file_no, files[i]->name);
+-
++void codegen_x86(Obj *prog, FILE *out) {
+   assign_lvar_offsets(prog);
+   emit_data(prog);
+   emit_text(prog);
++  println("  .text");
++  for (int i = 0; i < toplevel_asm.len; i++)
++    println("%s", toplevel_asm.data[i]);
++  if (opt_S) { fwrite(asm_buf, 1, asm_len, out); return; }
++  assemble_elf(asm_buf, out);
+ }
+
+exec
+/bin/bash -lc "sed -n '1,115p' cc/main.c; sed -n '1,65p' cc/type.c; sed -n '380,455p' cc/parse.c; sed -n '1510,1545p' cc/parse.c; sed -n '2900,2950p' cc/parse.c; sed -n '3220,3260p' cc/parse.c; sed -n '3330,3370p' cc/parse.c; sed -n '1055,1110p' cc/preprocess.c; rg -n \"opt_x86|ty_ldouble|long double|va_area|return_buffer|toplevel_asm|opt_fcommon\" cc --glob '"'!asm.c'"'" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+// Driver for the wasm backend: one translation unit in, one .wasm out.
+#include "chibicc.h"
+
+StringArray include_paths;
+bool opt_fpic;
+bool opt_fcommon = false;
+bool opt_x86;
+char *base_file;
+
+static bool opt_E;
+bool opt_S;   // x86: write assembly text instead of an ELF executable (debugging aid)
+static char *opt_o;
+static char *input_path;
+
+bool file_exists(char *path) {
+  struct stat st;
+  return !stat(path, &st);
+}
+
+static void define_arg(char *str) {
+  char *eq = strchr(str, '=');
+  if (eq)
+    define_macro(strndup(str, eq - str), eq + 1);
+  else
+    define_macro(str, "1");
+}
+
+static int parse_num(char *s, long lo, long hi, char *opt) {
+  char *end;
+  errno = 0;
+  long v = strtol(s, &end, 10);
+  if (errno || *end || !*s || v < lo || v > hi)
+    error("%s: expected a number in [%ld, %ld], got \"%s\"", opt, lo, hi, s);
+  return (int)v;
+}
+
+static void usage(int status) {
+  fprintf(stderr, "usage: cc [-E] [-mx86] [-I<dir>] [-D<macro>[=val]] [-mstack=<bytes>] [-mmaxpages=<n>] -o <out> <input.c>\n"
+                  "  default: wasm32 module; -mx86: static x86-64 ELF executable (no libc)\n");
+  exit(status);
+}
+
+static void parse_args(int argc, char **argv) {
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "-o")) { if (!argv[++i]) usage(1); opt_o = argv[i]; continue; }
+    if (!strncmp(argv[i], "-o", 2)) { opt_o = argv[i] + 2; continue; }
+    if (!strcmp(argv[i], "-E")) { opt_E = true; continue; }
+    if (!strcmp(argv[i], "-I")) { if (!argv[++i]) usage(1); strarray_push(&include_paths, argv[i]); continue; }
+    if (!strncmp(argv[i], "-I", 2)) { strarray_push(&include_paths, argv[i] + 2); continue; }
+    if (!strcmp(argv[i], "-D")) { if (!argv[++i]) usage(1); define_arg(argv[i]); continue; }
+    if (!strncmp(argv[i], "-D", 2)) { define_arg(argv[i] + 2); continue; }
+    if (!strncmp(argv[i], "-mstack=", 8)) { opt_stack_size = parse_num(argv[i] + 8, 16, 1 << 30, "-mstack"); continue; }
+    if (!strncmp(argv[i], "-mmaxpages=", 11)) { opt_max_pages = parse_num(argv[i] + 11, 1, 65536, "-mmaxpages"); continue; }
+    if (!strcmp(argv[i], "-mx86")) { opt_x86 = true; continue; }
+    if (!strcmp(argv[i], "-S")) { opt_S = true; continue; }
+    if (!strcmp(argv[i], "--help")) usage(0);
+    if (argv[i][0] == '-' && argv[i][1]) error("unknown argument: %s", argv[i]);
+    if (input_path) error("only one input file is supported");
+    input_path = argv[i];
+  }
+  if (!input_path) error("no input file");
+}
+
+static void print_tokens(Token *tok) {
+  int line = 1;
+  for (; tok->kind != TK_EOF; tok = tok->next) {
+    if (line > 1 && tok->at_bol) printf("\n");
+    if (tok->has_space && !tok->at_bol) printf(" ");
+    printf("%.*s", tok->len, tok->loc);
+    line++;
+  }
+  printf("\n");
+}
+
+int main(int argc, char **argv) {
+  parse_args(argc, argv);
+  if (opt_x86) set_target_lp64();
+  init_macros();
+  base_file = input_path;
+
+  Token *tok = tokenize_file(input_path);
+  if (!tok) error("%s: %s", input_path, strerror(errno));
+  tok = preprocess(tok);
+
+  if (opt_E) { print_tokens(tok); return 0; }
+
+  Obj *prog = parse(tok);
+  FILE *out = opt_o ? fopen(opt_o, "wb") : stdout;
+  if (!out) error("cannot open output file: %s: %s", opt_o, strerror(errno));
+  if (opt_x86) codegen_x86(prog, out);
+  else codegen(prog, out);
+  fclose(out);
+  return 0;
+}
+#include "chibicc.h"
+
+Type *ty_void = &(Type){TY_VOID, 1, 1};
+Type *ty_bool = &(Type){TY_BOOL, 1, 1};
+
+Type *ty_char = &(Type){TY_CHAR, 1, 1};
+Type *ty_short = &(Type){TY_SHORT, 2, 2};
+Type *ty_int = &(Type){TY_INT, 4, 4};
+Type *ty_long = &(Type){TY_LONG, 4, 4};
+Type *ty_llong = &(Type){TY_LONG, 8, 8};
+
+Type *ty_uchar = &(Type){TY_CHAR, 1, 1, true};
+Type *ty_ushort = &(Type){TY_SHORT, 2, 2, true};
+Type *ty_uint = &(Type){TY_INT, 4, 4, true};
+Type *ty_ulong = &(Type){TY_LONG, 4, 4, true};
+Type *ty_ullong = &(Type){TY_LONG, 8, 8, true};
+
+Type *ty_float = &(Type){TY_FLOAT, 4, 4};
+Type *ty_double = &(Type){TY_DOUBLE, 8, 8};
+Type *ty_ldouble = &(Type){TY_LDOUBLE, 8, 8};
+
+static int ptr_size = 4;
+
+// x86-64 target: long and pointers are 8 bytes, long double is the 16-byte x87 type
+void set_target_lp64(void) {
+  ty_long->size = ty_long->align = 8;
+  ty_ulong->size = ty_ulong->align = 8;
+  ty_ldouble->size = ty_ldouble->align = 16;
+  ptr_size = 8;
+}
+
+static Type *new_type(TypeKind kind, int size, int align) {
+  Type *ty = calloc(1, sizeof(Type));
+  ty->kind = kind;
+  ty->size = size;
+  ty->align = align;
+  return ty;
+}
+
+bool is_integer(Type *ty) {
+  TypeKind k = ty->kind;
+  return k == TY_BOOL || k == TY_CHAR || k == TY_SHORT ||
+         k == TY_INT  || k == TY_LONG || k == TY_ENUM;
+}
+
+bool is_flonum(Type *ty) {
+  return ty->kind == TY_FLOAT || ty->kind == TY_DOUBLE ||
+         ty->kind == TY_LDOUBLE;
+}
+
+bool is_numeric(Type *ty) {
+  return is_integer(ty) || is_flonum(ty);
+}
+
+bool is_compatible(Type *t1, Type *t2) {
+  if (t1 == t2)
+    return true;
+
+  if (t1->origin)
+    return is_compatible(t1->origin, t2);
+
+  if (t2->origin)
+    return is_compatible(t1, t2->origin);
+
+  if (t1->kind != t2->kind)
+// we returns the current type object.
+static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
+  // We use a single integer as counters for all typenames.
+  // For example, bits 0 and 1 represents how many times we saw the
+  // keyword "void" so far. With this, we can use a switch statement
+  // as you can see below.
+  enum {
+    VOID     = 1 << 0,
+    BOOL     = 1 << 2,
+    CHAR     = 1 << 4,
+    SHORT    = 1 << 6,
+    INT      = 1 << 8,
+    LONG     = 1 << 10,
+    FLOAT    = 1 << 12,
+    DOUBLE   = 1 << 14,
+    OTHER    = 1 << 16,
+    SIGNED   = 1 << 17,
+    UNSIGNED = 1 << 18,
+  };
+
+  Type *ty = ty_int;
+  int counter = 0;
+  bool is_atomic = false;
+
+  while (is_typename(tok)) {
+    // Handle storage class specifiers.
+    if (equal(tok, "typedef") || equal(tok, "static") || equal(tok, "extern") ||
+        equal(tok, "inline") || equal(tok, "_Thread_local") || equal(tok, "__thread")) {
+      if (!attr)
+        error_tok(tok, "storage class specifier is not allowed in this context");
+
+      if (equal(tok, "typedef"))
+        attr->is_typedef = true;
+      else if (equal(tok, "static"))
+        attr->is_static = true;
+      else if (equal(tok, "extern"))
+        attr->is_extern = true;
+      else if (equal(tok, "inline"))
+        attr->is_inline = true;
+      else
+        error_tok(tok, "thread-local storage is not supported by the wasm backend");
+
+      if (attr->is_typedef &&
+          attr->is_static + attr->is_extern + attr->is_inline + attr->is_tls > 1)
+        error_tok(tok, "typedef may not be used together with static,"
+                  " extern, inline, __thread or _Thread_local");
+      tok = tok->next;
+      continue;
+    }
+
+    // These keywords are recognized but ignored.
+    if (consume(&tok, tok, "const") || consume(&tok, tok, "volatile") ||
+        consume(&tok, tok, "auto") || consume(&tok, tok, "register") ||
+        consume(&tok, tok, "restrict") || consume(&tok, tok, "__restrict") ||
+        consume(&tok, tok, "__restrict__") || consume(&tok, tok, "_Noreturn"))
+      continue;
+
+    if (equal(tok, "_Atomic")) {
+      tok = tok->next;
+      if (equal(tok , "(")) {
+        ty = typename(&tok, tok->next);
+        tok = skip(tok, ")");
+      }
+      error_tok(tok, "_Atomic is not supported by the wasm backend");
+      continue;
+    }
+
+    if (equal(tok, "_Alignas")) {
+      if (!attr)
+        error_tok(tok, "_Alignas is not allowed in this context");
+      tok = skip(tok->next, "(");
+
+      if (is_typename(tok))
+        attr->align = typename(&tok, tok)->align;
+      else
+        attr->align = const_expr(&tok, tok);
+      "const", "volatile", "auto", "register", "restrict", "__restrict",
+      "__restrict__", "_Noreturn", "float", "double", "typeof", "inline",
+      "_Thread_local", "__thread", "_Atomic",
+    };
+
+    for (int i = 0; i < sizeof(kw) / sizeof(*kw); i++)
+      hashmap_put(&map, kw[i], (void *)1);
+  }
+
+  return hashmap_get2(&map, tok->loc, tok->len) || find_typedef(tok);
+}
+
+// asm-stmt = "asm" ("volatile" | "inline")* "(" string-literal ")"
+static Node *asm_stmt(Token **rest, Token *tok) {
+  Node *node = new_node(ND_ASM, tok);
+  tok = tok->next;
+
+  while (equal(tok, "volatile") || equal(tok, "inline"))
+    tok = tok->next;
+
+  tok = skip(tok, "(");
+  if (tok->kind != TK_STR || tok->ty->base->kind != TY_CHAR)
+    error_tok(tok, "expected string literal");
+  node->asm_str = tok->str;
+  *rest = skip(tok->next, ")");
+  return node;
+}
+
+// stmt = "return" expr? ";"
+//      | "if" "(" expr ")" stmt ("else" stmt)?
+//      | "switch" "(" expr ")" stmt
+//      | "case" const-expr ("..." const-expr)? ":" stmt
+//      | "default" ":" stmt
+//      | "for" "(" expr-stmt expr? ";" expr? ")" stmt
+//      | "while" "(" expr ")" stmt
+//      | "do" stmt "while" "(" expr ")" ";"
+
+    if (!param_ty && !ty->is_variadic)
+      error_tok(tok, "too many arguments");
+
+    if (param_ty) {
+      if (param_ty->kind != TY_STRUCT && param_ty->kind != TY_UNION)
+        arg = new_cast(arg, param_ty);
+      param_ty = param_ty->next;
+    } else if (arg->ty->kind == TY_FLOAT) {
+      // If parameter type is omitted (e.g. in "..."), float
+      // arguments are promoted to double.
+      arg = new_cast(arg, ty_double);
+    }
+
+    cur = cur->next = arg;
+  }
+
+  if (param_ty)
+    error_tok(tok, "too few arguments");
+
+  *rest = skip(tok, ")");
+
+  Node *node = new_unary(ND_FUNCALL, fn, tok);
+  node->func_ty = ty;
+  node->ty = ty->return_ty;
+  node->args = head.next;
+
+  // If a function returns a struct, it is caller's responsibility
+  // to allocate a space for the return value.
+  if (node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION)
+    node->ret_buffer = new_lvar("", node->ty);
+  return node;
+}
+
+// generic-selection = "(" assign "," generic-assoc ("," generic-assoc)* ")"
+//
+// generic-assoc = type-name ":" assign
+//               | "default" ":" assign
+static Node *generic_selection(Token **rest, Token *tok) {
+  Token *start = tok;
+  tok = skip(tok, "(");
+
+  Node *ctrl = assign(&tok, tok);
+  add_type(ctrl);
+
+  Type *t1 = ctrl->ty;
+  if (t1->kind == TY_FUNC)
+    t1 = pointer_to(t1);
+  else if (t1->kind == TY_ARRAY)
+    t1 = pointer_to(t1->base);
+
+    fn->is_definition = fn->is_definition || equal(tok, "{");
+  } else {
+    fn = new_gvar(name_str, ty);
+    fn->is_function = true;
+    fn->is_definition = equal(tok, "{");
+    fn->is_static = attr->is_static || (attr->is_inline && !attr->is_extern);
+    fn->is_inline = attr->is_inline;
+  }
+
+  fn->is_root = !(fn->is_static && fn->is_inline);
+
+  if (consume(&tok, tok, ";"))
+    return tok;
+
+  current_fn = fn;
+  locals = NULL;
+  enter_scope();
+  create_param_lvars(ty->params);
+
+  // A buffer for a struct/union return value is passed
+  // as the hidden first parameter.
+  Type *rty = ty->return_ty;
+  if ((rty->kind == TY_STRUCT || rty->kind == TY_UNION) && (!opt_x86 || rty->size > 16))
+    new_lvar("", pointer_to(rty));
+
+  fn->params = locals;
+
+  if (ty->is_variadic)
+    fn->va_area = opt_x86 ? new_lvar("__va_area__", array_of(ty_char, 136))
+                          : new_lvar("__va_area__", pointer_to(ty_char));
+  fn->alloca_bottom = new_lvar("__alloca_size__", pointer_to(ty_char));
+
+  tok = skip(tok, "{");
+
+  // [https://www.sigbus.info/n1570#6.4.2.2p1] "__func__" is
+  // automatically defined as a local variable containing the
+  // current function name.
+  push_scope("__func__")->var =
+    new_string_literal(fn->name, array_of(ty_char, strlen(fn->name) + 1));
+
+  // [GNU] __FUNCTION__ is yet another name of __func__.
+  }
+
+  cur->next = NULL;
+  globals = head.next;
+}
+
+static void declare_builtin_functions(void) {
+  Type *ty = func_type(pointer_to(ty_void));
+  ty->params = copy_type(ty_int);
+  builtin_alloca = new_gvar("alloca", ty);
+  builtin_alloca->is_definition = false;
+}
+
+// program = (typedef | function-definition | global-variable)*
+StringArray toplevel_asm;
+
+Obj *parse(Token *tok) {
+  declare_builtin_functions();
+  globals = NULL;
+
+  while (tok->kind != TK_EOF) {
+    // file-scope asm("...") (used by the no-libc host for _start and the syscall stub)
+    if (equal(tok, "asm") || equal(tok, "__asm__")) {
+      tok = skip(tok->next, "(");
+      if (tok->kind != TK_STR) error_tok(tok, "expected string literal");
+      strarray_push(&toplevel_asm, tok->str);
+      tok = skip(skip(tok->next, ")"), ";");
+      continue;
+    }
+
+    VarAttr attr = {};
+    Type *basety = declspec(&tok, tok, &attr);
+
+    // Typedef
+    if (attr.is_typedef) {
+      tok = parse_typedef(tok, basety);
+      continue;
+    }
+
+    // Function
+    if (is_function(tok)) {
+// __TIME__ is expanded to the current time, e.g. "13:34:03".
+static char *format_time(struct tm *tm) {
+  return format("\"%02d:%02d:%02d\"", tm->tm_hour, tm->tm_min, tm->tm_sec);
+}
+
+void init_macros(void) {
+  // Define predefined macros
+  define_macro("__C99_MACRO_WITH_VA_ARGS", "1");
+  if (opt_x86) {
+    define_macro("__LP64__", "1");
+    define_macro("_LP64", "1");
+    define_macro("__x86_64__", "1");
+    define_macro("__x86_64", "1");
+    define_macro("__amd64__", "1");
+    define_macro("__SIZEOF_LONG__", "8");
+    define_macro("__SIZEOF_POINTER__", "8");
+    define_macro("__SIZEOF_PTRDIFF_T__", "8");
+    define_macro("__SIZEOF_SIZE_T__", "8");
+    define_macro("__SIZEOF_LONG_DOUBLE__", "16");
+  } else {
+    define_macro("__ILP32__", "1");
+    define_macro("__wasm__", "1");
+    define_macro("__wasm32__", "1");
+    define_macro("__SIZEOF_LONG__", "4");
+    define_macro("__SIZEOF_POINTER__", "4");
+    define_macro("__SIZEOF_PTRDIFF_T__", "4");
+    define_macro("__SIZEOF_SIZE_T__", "4");
+    }
+  define_macro("__LITTLE_ENDIAN__", "1");
+  define_macro("__ORDER_LITTLE_ENDIAN__", "1234");
+  define_macro("__ORDER_BIG_ENDIAN__", "4321");
+  define_macro("__BYTE_ORDER__", "1234");
+  define_macro("__SIZE_TYPE__", "unsigned long");
+  define_macro("__STDC_HOSTED__", "1");
+  define_macro("__STDC_NO_COMPLEX__", "1");
+  define_macro("__STDC_UTF_16__", "1");
+  define_macro("__STDC_UTF_32__", "1");
+  define_macro("__STDC_VERSION__", "201112L");
+  define_macro("__STDC__", "1");
+  define_macro("__USER_LABEL_PREFIX__", "");
+  define_macro("__alignof__", "_Alignof");
+  define_macro("__chibicc__", "1");
+  define_macro("__const__", "const");
+  define_macro("__inline__", "inline");
+  define_macro("__signed__", "signed");
+  define_macro("__typeof__", "typeof");
+  define_macro("__volatile__", "volatile");
+
+  add_builtin("__FILE__", file_macro);
+  add_builtin("__LINE__", line_macro);
+  add_builtin("__COUNTER__", counter_macro);
+  add_builtin("__TIMESTAMP__", timestamp_macro);
+  add_builtin("__BASE_FILE__", base_file_macro);
+
+  time_t now = time(NULL);
+  struct tm *tm = localtime(&now);
+cc/main.c:6:bool opt_fcommon = false;
+cc/main.c:7:bool opt_x86;
+cc/main.c:54:    if (!strcmp(argv[i], "-mx86")) { opt_x86 = true; continue; }
+cc/main.c:77:  if (opt_x86) set_target_lp64();
+cc/main.c:90:  if (opt_x86) codegen_x86(prog, out);
+cc/chibicc.h:78:  long double fval; // If kind is TK_NUM, its value
+cc/chibicc.h:154:  Obj *va_area;
+cc/chibicc.h:290:  long double fval;
+cc/chibicc.h:394:extern Type *ty_ldouble;
+cc/chibicc.h:418:extern bool opt_x86;          // target: x86-64 static ELF (LP64) instead of wasm32 (ILP32)
+cc/chibicc.h:419:extern StringArray toplevel_asm;
+cc/chibicc.h:466:extern bool opt_fcommon;
+cc/parse.c:568:      ty = ty_ldouble;
+cc/parse.c:3242:  if ((rty->kind == TY_STRUCT || rty->kind == TY_UNION) && (!opt_x86 || rty->size > 16))
+cc/parse.c:3248:    fn->va_area = opt_x86 ? new_lvar("__va_area__", array_of(ty_char, 136))
+cc/parse.c:3249:                          : new_lvar("__va_area__", pointer_to(ty_char));
+cc/parse.c:3344:StringArray toplevel_asm;
+cc/parse.c:3355:      strarray_push(&toplevel_asm, tok->str);
+cc/type.c:20:Type *ty_ldouble = &(Type){TY_LDOUBLE, 8, 8};
+cc/type.c:24:// x86-64 target: long and pointers are 8 bytes, long double is the 16-byte x87 type
+cc/type.c:28:  ty_ldouble->size = ty_ldouble->align = 16;
+cc/type.c:156:    return ty_ldouble;
+cc/tokenize.c:442:  long double val = strtold(tok->loc, &end);
+cc/tokenize.c:449:    ty = ty_ldouble;
+cc/preprocess.c:1063:  if (opt_x86) {
+cc/codegen_x86.c:719:      union { long double f80; uint64_t u64[2]; } u;
+cc/codegen_x86.c:722:      println("  mov $%lu, %%rax  # long double %Lf", u.u64[0], node->fval);
+cc/codegen_x86.c:1397:    if (opt_fcommon && var->is_tentative) {
+cc/codegen_x86.c:1502:    if (fn->va_area) {
+cc/codegen_x86.c:1511:      int off = fn->va_area->offset;
+cc/codegen_x86.c:1595:  for (int i = 0; i < toplevel_asm.len; i++)
+cc/codegen_x86.c:1596:    println("%s", toplevel_asm.data[i]);
+cc/codegen.c:6:// are i64, float is f32, double and long double are f64. Struct-typed
+cc/codegen.c:806:    fp_plus(fn->va_area->offset); op_u(OP_LOCAL_GET, i); memarg(OP_I32_STORE, 2);
+cc/codegen.c:906:  if (toplevel_asm.len) error("file-scope asm is not supported by the wasm backend");
+
+exec
+/bin/bash -lc "rg -n 'println\\(\"["'^"'"\\n]*#|\\.section|\\.p2align|\\.string|\\.value|\\.long|\\.quad|\\.byte|\\.zero|\\.comm|@GOTPCREL|[0-9][fb]' cc/codegen_x86.c | head -200; sed -n '680,735p' cc/codegen_x86.c; sed -n '1370,1530p' cc/codegen_x86.c; git status --short; ls tests | head" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+11:static char *argreg8[] = {"%dil", "%sil", "%dl", "%cl", "%r8b", "%r9b"};
+107:        println("  .value 0x6666");
+114:      println("  mov %s@GOTPCREL(%%rip), %%rax", node->var->name);
+146:    // Global Offset Table using `@GOTPCREL(%rip)` notation.
+153:        println("  mov %s@GOTPCREL(%%rip), %%rax", node->var->name);
+243:      println("  mov %d(%%rax), %%r8b", i);
+244:      println("  mov %%r8b, %d(%%rdi)", i);
+318:static char i32f32[] = "cvtsi2ssl %eax, %xmm0";
+320:static char i32f64[] = "cvtsi2sdl %eax, %xmm0";
+321:static char i32f80[] = "mov %eax, -4(%rsp); fildl -4(%rsp)";
+323:static char u32f32[] = "mov %eax, %eax; cvtsi2ssq %rax, %xmm0";
+325:static char u32f64[] = "mov %eax, %eax; cvtsi2sdq %rax, %xmm0";
+326:static char u32f80[] = "mov %eax, %eax; mov %rax, -8(%rsp); fildll -8(%rsp)";
+328:static char i64f32[] = "cvtsi2ssq %rax, %xmm0";
+329:static char i64f64[] = "cvtsi2sdq %rax, %xmm0";
+330:static char i64f80[] = "movq %rax, -8(%rsp); fildll -8(%rsp)";
+332:static char u64f32[] = "cvtsi2ssq %rax, %xmm0";
+333:static char u64f64[] =
+334:  "test %rax,%rax; js 1f; pxor %xmm0,%xmm0; cvtsi2sd %rax,%xmm0; jmp 2f; "
+337:static char u64f80[] =
+338:  "mov %rax, -8(%rsp); fildq -8(%rsp); test %rax, %rax; jns 1f;"
+349:static char f32f64[] = "cvtss2sd %xmm0, %xmm0";
+350:static char f32f80[] = "movss %xmm0, -4(%rsp); flds -4(%rsp)";
+360:static char f64f32[] = "cvtsd2ss %xmm0, %xmm0";
+361:static char f64f80[] = "movsd %xmm0, -8(%rsp); fldl -8(%rsp)";
+377:static char f80f32[] = "fstps -8(%rsp); movss -8(%rsp), %xmm0";
+378:static char f80f64[] = "fstpl -8(%rsp); movsd -8(%rsp), %xmm0";
+382:  {NULL,  NULL,   NULL,   i32i64, i32u8, i32u16, NULL,   i32i64, i32f32, i32f64, i32f80}, // i8
+383:  {i32i8, NULL,   NULL,   i32i64, i32u8, i32u16, NULL,   i32i64, i32f32, i32f64, i32f80}, // i16
+384:  {i32i8, i32i16, NULL,   i32i64, i32u8, i32u16, NULL,   i32i64, i32f32, i32f64, i32f80}, // i32
+385:  {i32i8, i32i16, NULL,   NULL,   i32u8, i32u16, NULL,   NULL,   i64f32, i64f64, i64f80}, // i64
+387:  {i32i8, NULL,   NULL,   i32i64, NULL,  NULL,   NULL,   i32i64, i32f32, i32f64, i32f80}, // u8
+388:  {i32i8, i32i16, NULL,   i32i64, i32u8, NULL,   NULL,   i32i64, i32f32, i32f64, i32f80}, // u16
+389:  {i32i8, i32i16, NULL,   u32i64, i32u8, i32u16, NULL,   u32i64, u32f32, u32f64, u32f80}, // u32
+390:  {i32i8, i32i16, NULL,   NULL,   i32u8, i32u16, NULL,   NULL,   u64f32, u64f64, u64f80}, // u64
+392:  {f32i8, f32i16, f32i32, f32i64, f32u8, f32u16, f32u32, f32u64, NULL,   f32f64, f32f80}, // f32
+393:  {f64i8, f64i16, f64i32, f64i64, f64u8, f64u16, f64u32, f64u64, f64f32, NULL,   f64f80}, // f64
+394:  {f80i8, f80i16, f80i32, f80i64, f80u8, f80u16, f80u32, f80u64, f80f32, f80f64, NULL},   // f80
+458:    println("  mov %d(%%rax), %%r10b", i);
+459:    println("  mov %%r10b, %d(%%rsp)", i);
+683:  println("  je 2f");
+684:  println("  mov (%%rax), %%r8b");
+685:  println("  mov %%r8b, (%%rdx)");
+689:  println("  jmp 1b");
+708:      println("  mov $%u, %%eax  # float %Lf", u.u32, node->fval);
+714:      println("  mov $%lu, %%rax  # double %Lf", u.u64, node->fval);
+722:      println("  mov $%lu, %%rax  # long double %Lf", u.u64[0], node->fval);
+993:    println("  je 1f");
+1398:      println("  .comm %s, %d, %d", var->name, var->ty->size, align);
+1405:        println("  .section .tdata,\"awT\",@progbits");
+1418:          println("  .quad %s%+ld", *rel->label, rel->addend);
+1422:          println("  .byte %d", var->init_data[pos++]);
+1430:      println("  .section .tbss,\"awT\",@nobits");
+1436:    println("  .zero %d", var->ty->size);
+  println("  mov %%rsp, %%rdx");
+  println("1:");
+  println("  cmp $0, %%rcx");
+  println("  je 2f");
+  println("  mov (%%rax), %%r8b");
+  println("  mov %%r8b, (%%rdx)");
+  println("  inc %%rdx");
+  println("  inc %%rax");
+  println("  dec %%rcx");
+  println("  jmp 1b");
+  println("2:");
+
+  // Move alloca_bottom pointer.
+  println("  mov %d(%%rbp), %%rax", current_fn->alloca_bottom->offset);
+  println("  sub %%rdi, %%rax");
+  println("  mov %%rax, %d(%%rbp)", current_fn->alloca_bottom->offset);
+}
+
+// Generate code for a given node.
+static void gen_expr(Node *node) {
+
+  switch (node->kind) {
+  case ND_NULL_EXPR:
+    return;
+  case ND_NUM: {
+    switch (node->ty->kind) {
+    case TY_FLOAT: {
+      union { float f32; uint32_t u32; } u = { node->fval };
+      println("  mov $%u, %%eax  # float %Lf", u.u32, node->fval);
+      println("  movq %%rax, %%xmm0");
+      return;
+    }
+    case TY_DOUBLE: {
+      union { double f64; uint64_t u64; } u = { node->fval };
+      println("  mov $%lu, %%rax  # double %Lf", u.u64, node->fval);
+      println("  movq %%rax, %%xmm0");
+      return;
+    }
+    case TY_LDOUBLE: {
+      union { long double f80; uint64_t u64[2]; } u;
+      memset(&u, 0, sizeof(u));
+      u.f80 = node->fval;
+      println("  mov $%lu, %%rax  # long double %Lf", u.u64[0], node->fval);
+      println("  mov %%rax, -16(%%rsp)");
+      println("  mov $%lu, %%rax", u.u64[1]);
+      println("  mov %%rax, -8(%%rsp)");
+      println("  fldt -16(%%rsp)");
+      return;
+    }
+    }
+
+    println("  mov $%ld, %%rax", node->val);
+    return;
+  }
+  case ND_NEG:
+    gen_expr(node->lhs);
+      // https://github.com/hjl-tools/x86-psABI/wiki/x86-64-psABI-draft.pdf.
+      int align = (var->ty->kind == TY_ARRAY && var->ty->size >= 16)
+        ? MAX(16, var->align) : var->align;
+
+      bottom += var->ty->size;
+      bottom = align_to(bottom, align);
+      var->offset = -bottom;
+    }
+
+    fn->stack_size = align_to(bottom, 16);
+  }
+}
+
+static void emit_data(Obj *prog) {
+  for (Obj *var = prog; var; var = var->next) {
+    if (var->is_function || !var->is_definition)
+      continue;
+
+    if (var->is_static)
+      println("  .local %s", var->name);
+    else
+      println("  .globl %s", var->name);
+
+    int align = (var->ty->kind == TY_ARRAY && var->ty->size >= 16)
+      ? MAX(16, var->align) : var->align;
+
+    // Common symbol
+    if (opt_fcommon && var->is_tentative) {
+      println("  .comm %s, %d, %d", var->name, var->ty->size, align);
+      continue;
+    }
+
+    // .data or .tdata
+    if (var->init_data) {
+      if (var->is_tls)
+        println("  .section .tdata,\"awT\",@progbits");
+      else
+        println("  .data");
+
+      println("  .type %s, @object", var->name);
+      println("  .size %s, %d", var->name, var->ty->size);
+      println("  .align %d", align);
+      println("%s:", var->name);
+
+      Relocation *rel = var->rel;
+      int pos = 0;
+      while (pos < var->ty->size) {
+        if (rel && rel->offset == pos) {
+          println("  .quad %s%+ld", *rel->label, rel->addend);
+          rel = rel->next;
+          pos += 8;
+        } else {
+          println("  .byte %d", var->init_data[pos++]);
+        }
+      }
+      continue;
+    }
+
+    // .bss or .tbss
+    if (var->is_tls)
+      println("  .section .tbss,\"awT\",@nobits");
+    else
+      println("  .bss");
+
+    println("  .align %d", align);
+    println("%s:", var->name);
+    println("  .zero %d", var->ty->size);
+  }
+}
+
+static void store_fp(int r, int offset, int sz) {
+  switch (sz) {
+  case 4:
+    println("  movss %%xmm%d, %d(%%rbp)", r, offset);
+    return;
+  case 8:
+    println("  movsd %%xmm%d, %d(%%rbp)", r, offset);
+    return;
+  }
+  unreachable();
+}
+
+static void store_gp(int r, int offset, int sz) {
+  switch (sz) {
+  case 1:
+    println("  mov %s, %d(%%rbp)", argreg8[r], offset);
+    return;
+  case 2:
+    println("  mov %s, %d(%%rbp)", argreg16[r], offset);
+    return;
+  case 4:
+    println("  mov %s, %d(%%rbp)", argreg32[r], offset);
+    return;
+  case 8:
+    println("  mov %s, %d(%%rbp)", argreg64[r], offset);
+    return;
+  default:
+    for (int i = 0; i < sz; i++) {
+      println("  mov %s, %d(%%rbp)", argreg8[r], offset + i);
+      println("  shr $8, %s", argreg64[r]);
+    }
+    return;
+  }
+}
+
+static void emit_text(Obj *prog) {
+  for (Obj *fn = prog; fn; fn = fn->next) {
+    if (!fn->is_function || !fn->is_definition)
+      continue;
+
+    // No code is emitted for "static inline" functions
+    // if no one is referencing them.
+    if (!fn->is_live)
+      continue;
+
+    if (fn->is_static)
+      println("  .local %s", fn->name);
+    else
+      println("  .globl %s", fn->name);
+
+    println("  .text");
+    println("  .type %s, @function", fn->name);
+    println("%s:", fn->name);
+    current_fn = fn;
+
+    // Prologue
+    println("  push %%rbp");
+    println("  mov %%rsp, %%rbp");
+    println("  sub $%d, %%rsp", fn->stack_size);
+    println("  mov %%rsp, %d(%%rbp)", fn->alloca_bottom->offset);
+
+    // Save arg registers if function is variadic
+    if (fn->va_area) {
+      int gp = 0, fp = 0;
+      for (Obj *var = fn->params; var; var = var->next) {
+        if (is_flonum(var->ty))
+          fp++;
+        else
+          gp++;
+      }
+
+      int off = fn->va_area->offset;
+
+      // va_elem
+      println("  movl $%d, %d(%%rbp)", gp * 8, off);          // gp_offset
+      println("  movl $%d, %d(%%rbp)", fp * 8 + 48, off + 4); // fp_offset
+      println("  movq %%rbp, %d(%%rbp)", off + 8);            // overflow_arg_area
+      println("  addq $16, %d(%%rbp)", off + 8);
+      println("  movq %%rbp, %d(%%rbp)", off + 16);           // reg_save_area
+      println("  addq $%d, %d(%%rbp)", off + 24, off + 16);
+
+      // __reg_save_area__
+      println("  movq %%rdi, %d(%%rbp)", off + 24);
+      println("  movq %%rsi, %d(%%rbp)", off + 32);
+      println("  movq %%rdx, %d(%%rbp)", off + 40);
+      println("  movq %%rcx, %d(%%rbp)", off + 48);
+      println("  movq %%r8, %d(%%rbp)", off + 56);
+      println("  movq %%r9, %d(%%rbp)", off + 64);
+      println("  movsd %%xmm0, %d(%%rbp)", off + 72);
+      println("  movsd %%xmm1, %d(%%rbp)", off + 80);
+      println("  movsd %%xmm2, %d(%%rbp)", off + 88);
+?? reviews/codex-review-3.log
+?? reviews/request-3.md
+asm-diff.sh
+cc
+mkwasm.py
+run-x86.sh
+run.sh
+tests.mk
+
+exec
+/bin/bash -lc "ls -l cc/cc cc/chibicc 2>/dev/null || true; sed -n '85,120p' cc/codegen_x86.c; sed -n '300,370p' cc/codegen_x86.c; sed -n '880,920p' cc/codegen.c; find . -maxdepth 2 -type f -perm -111 -print" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+
+// Compute the absolute address of a given node.
+// It's an error if a given node does not reside in memory.
+static void gen_addr(Node *node) {
+  switch (node->kind) {
+  case ND_VAR:
+    // Variable-length array, which is always local.
+    if (node->var->ty->kind == TY_VLA) {
+      println("  mov %d(%%rbp), %%rax", node->var->offset);
+      return;
+    }
+
+    // Local variable
+    if (node->var->is_local) {
+      println("  lea %d(%%rbp), %%rax", node->var->offset);
+      return;
+    }
+
+    if (opt_fpic) {
+      // Thread-local variable
+      if (node->var->is_tls) {
+        println("  data16 lea %s@tlsgd(%%rip), %%rdi", node->var->name);
+        println("  .value 0x6666");
+        println("  rex64");
+        println("  call __tls_get_addr@PLT");
+        return;
+      }
+
+      // Function or global variable
+      println("  mov %s@GOTPCREL(%%rip), %%rax", node->var->name);
+      return;
+    }
+
+    // Thread-local variable
+    if (node->var->is_tls) {
+      println("  mov %%fs:0, %%rax");
+    return ty->is_unsigned ? U32 : I32;
+  case TY_LONG:
+    return ty->is_unsigned ? U64 : I64;
+  case TY_FLOAT:
+    return F32;
+  case TY_DOUBLE:
+    return F64;
+  case TY_LDOUBLE:
+    return F80;
+  }
+  return U64;
+}
+
+// The table for type casts
+static char i32i8[] = "movsbl %al, %eax";
+static char i32u8[] = "movzbl %al, %eax";
+static char i32i16[] = "movswl %ax, %eax";
+static char i32u16[] = "movzwl %ax, %eax";
+static char i32f32[] = "cvtsi2ssl %eax, %xmm0";
+static char i32i64[] = "movsxd %eax, %rax";
+static char i32f64[] = "cvtsi2sdl %eax, %xmm0";
+static char i32f80[] = "mov %eax, -4(%rsp); fildl -4(%rsp)";
+
+static char u32f32[] = "mov %eax, %eax; cvtsi2ssq %rax, %xmm0";
+static char u32i64[] = "mov %eax, %eax";
+static char u32f64[] = "mov %eax, %eax; cvtsi2sdq %rax, %xmm0";
+static char u32f80[] = "mov %eax, %eax; mov %rax, -8(%rsp); fildll -8(%rsp)";
+
+static char i64f32[] = "cvtsi2ssq %rax, %xmm0";
+static char i64f64[] = "cvtsi2sdq %rax, %xmm0";
+static char i64f80[] = "movq %rax, -8(%rsp); fildll -8(%rsp)";
+
+static char u64f32[] = "cvtsi2ssq %rax, %xmm0";
+static char u64f64[] =
+  "test %rax,%rax; js 1f; pxor %xmm0,%xmm0; cvtsi2sd %rax,%xmm0; jmp 2f; "
+  "1: mov %rax,%rdi; and $1,%eax; pxor %xmm0,%xmm0; shr %rdi; "
+  "or %rax,%rdi; cvtsi2sd %rdi,%xmm0; addsd %xmm0,%xmm0; 2:";
+static char u64f80[] =
+  "mov %rax, -8(%rsp); fildq -8(%rsp); test %rax, %rax; jns 1f;"
+  "mov $1602224128, %eax; mov %eax, -4(%rsp); fadds -4(%rsp); 1:";
+
+static char f32i8[] = "cvttss2sil %xmm0, %eax; movsbl %al, %eax";
+static char f32u8[] = "cvttss2sil %xmm0, %eax; movzbl %al, %eax";
+static char f32i16[] = "cvttss2sil %xmm0, %eax; movswl %ax, %eax";
+static char f32u16[] = "cvttss2sil %xmm0, %eax; movzwl %ax, %eax";
+static char f32i32[] = "cvttss2sil %xmm0, %eax";
+static char f32u32[] = "cvttss2siq %xmm0, %rax";
+static char f32i64[] = "cvttss2siq %xmm0, %rax";
+static char f32u64[] = "cvttss2siq %xmm0, %rax";
+static char f32f64[] = "cvtss2sd %xmm0, %xmm0";
+static char f32f80[] = "movss %xmm0, -4(%rsp); flds -4(%rsp)";
+
+static char f64i8[] = "cvttsd2sil %xmm0, %eax; movsbl %al, %eax";
+static char f64u8[] = "cvttsd2sil %xmm0, %eax; movzbl %al, %eax";
+static char f64i16[] = "cvttsd2sil %xmm0, %eax; movswl %ax, %eax";
+static char f64u16[] = "cvttsd2sil %xmm0, %eax; movzwl %ax, %eax";
+static char f64i32[] = "cvttsd2sil %xmm0, %eax";
+static char f64u32[] = "cvttsd2siq %xmm0, %rax";
+static char f64i64[] = "cvttsd2siq %xmm0, %rax";
+static char f64u64[] = "cvttsd2siq %xmm0, %rax";
+static char f64f32[] = "cvtsd2ss %xmm0, %xmm0";
+static char f64f80[] = "movsd %xmm0, -8(%rsp); fldl -8(%rsp)";
+
+#define FROM_F80_1                                           \
+  "fnstcw -10(%rsp); movzwl -10(%rsp), %eax; or $12, %ah; " \
+  "mov %ax, -12(%rsp); fldcw -12(%rsp); "
+
+#define FROM_F80_2 " -24(%rsp); fldcw -10(%rsp); "
+
+static char f80i8[] = FROM_F80_1 "fistps" FROM_F80_2 "movsbl -24(%rsp), %eax";
+static char f80u8[] = FROM_F80_1 "fistps" FROM_F80_2 "movzbl -24(%rsp), %eax";
+  int n = data_end - data_base;
+  uint8_t *img = calloc(1, n ? n : 1);
+  for (Obj *var = prog; var; var = var->next) {
+    if (var->is_function || !var->is_definition || !var->init_data) continue;
+    if (hashmap_get(&global_def, var->name) != var) continue;
+    memcpy(img + var->offset - data_base, var->init_data, var->ty->size);
+    for (Relocation *rel = var->rel; rel; rel = rel->next) {
+      Obj *target = NULL;
+      for (Obj *o = prog; o; o = o->next)
+        if (!strcmp(o->name, *rel->label)) { target = o; break; }
+      if (!target) error("relocation to unknown symbol %s", *rel->label);
+      uint32_t v = (uint32_t)(global_addr(target, var->tok) + rel->addend);
+      for (int k = 0; k < 4; k++) img[var->offset - data_base + rel->offset + k] = (v >> (8 * k)) & 0xff;
+    }
+  }
+  buf_uleb(sec, 1);               // one segment
+  buf_u8(sec, 0);                 // active, memory 0
+  buf_u8(sec, OP_I32_CONST); buf_sleb(sec, data_base); buf_u8(sec, OP_END);
+  buf_uleb(sec, n);
+  buf_bytes(sec, img, n);
+  free(img);
+}
+
+int align_to(int n, int align) { return (n + align - 1) / align * align; }
+
+void codegen(Obj *prog, FILE *out) {
+  if (toplevel_asm.len) error("file-scope asm is not supported by the wasm backend");
+  // the parser prepends, so prog is in reverse source order; reverse it for stable numbering
+  Obj *rev = NULL;
+  for (Obj *o = prog; o;) { Obj *next = o->next; o->next = rev; rev = o; o = next; }
+  prog = rev;
+
+  for (Obj *fn = prog; fn; fn = fn->next)
+    if (fn->is_function && fn->is_definition) mark_refs(fn->body);
+  for (Obj *var = prog; var; var = var->next)
+    if (!var->is_function && var->is_definition)
+      for (Relocation *rel = var->rel; rel; rel = rel->next)
+        hashmap_put(&referenced, *rel->label, (void *)1);
+
+  // number functions: env imports first, then definitions
+  Buf imports = {0}, funcsec = {0};
+./build/chibicc-wasm
+./build/pf
+./build/escape.wasm
+./build/w2c2-native
+./build/cat.wasm
+./build/chibicc-wasm-tcc
+./build/control
+./build/w2c2.wasm
+./build/rot13.wasm
+./build/evil.wasm
+./build/grow.wasm
+./w2c2/datasegment.h
+./w2c2/getopt_impl.h
+./w2c2/elementsegment.h
+./w2c2/memory.h
+./w2c2/table.h
+./tools/serve.sh
+./tools/mksite.py
+./tools/fixpoint.sh
+./tools/split.py
+./tools/measure.py
+./tests/run.sh
+./tests/asm-diff.sh
+./tests/run-x86.sh
+
+exec
+/bin/bash -lc "diff -u /home/exedev/src/chibicc/parse.c cc/parse.c | sed -n '1,240p'; diff -u /home/exedev/src/chibicc/type.c cc/type.c; diff -u /home/exedev/src/chibicc/preprocess.c cc/preprocess.c | tail -100; nl -ba cc/parse.c | sed -n '3235,3260p;3340,3365p'; nl -ba cc/type.c | sed -n '1,40p'; nl -ba cc/main.c | sed -n '1,100p'; nl -ba cc/preprocess.c | sed -n '1058,1102p'" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+--- /home/exedev/src/chibicc/parse.c	2026-09-04 17:10:36.846273790 +0000
++++ cc/parse.c	2026-09-04 20:43:31.772134824 +0000
+@@ -417,7 +417,7 @@
+       else if (equal(tok, "inline"))
+         attr->is_inline = true;
+       else
+-        attr->is_tls = true;
++        error_tok(tok, "thread-local storage is not supported by the wasm backend");
+ 
+       if (attr->is_typedef &&
+           attr->is_static + attr->is_extern + attr->is_inline + attr->is_tls > 1)
+@@ -440,7 +440,7 @@
+         ty = typename(&tok, tok->next);
+         tok = skip(tok, ")");
+       }
+-      is_atomic = true;
++      error_tok(tok, "_Atomic is not supported by the wasm backend");
+       continue;
+     }
+ 
+@@ -540,19 +540,23 @@
+       break;
+     case LONG:
+     case LONG + INT:
+-    case LONG + LONG:
+-    case LONG + LONG + INT:
+     case SIGNED + LONG:
+     case SIGNED + LONG + INT:
++      ty = ty_long;
++      break;
++    case LONG + LONG:
++    case LONG + LONG + INT:
+     case SIGNED + LONG + LONG:
+     case SIGNED + LONG + LONG + INT:
+-      ty = ty_long;
++      ty = ty_llong;
+       break;
+     case UNSIGNED + LONG:
+     case UNSIGNED + LONG + INT:
++      ty = ty_ulong;
++      break;
+     case UNSIGNED + LONG + LONG:
+     case UNSIGNED + LONG + LONG + INT:
+-      ty = ty_ulong;
++      ty = ty_ullong;
+       break;
+     case FLOAT:
+       ty = ty_float;
+@@ -572,7 +576,7 @@
+ 
+   if (is_atomic) {
+     ty = copy_type(ty);
+-    ty->is_atomic = true;
++    error_tok(tok, "_Atomic is not supported by the wasm backend");
+   }
+ 
+   *rest = tok;
+@@ -582,8 +586,10 @@
+ // func-params = ("void" | param ("," param)* ("," "...")?)? ")"
+ // param       = declspec declarator
+ static Type *func_params(Token **rest, Token *tok, Type *ty) {
+-  if (equal(tok, "void") && equal(tok->next, ")")) {
+-    *rest = tok->next->next;
++  // wasm backend: an empty parameter list means "no parameters", not
++  // "unspecified"; calls with arguments are then rejected as too many.
++  if ((equal(tok, "void") && equal(tok->next, ")")) || equal(tok, ")")) {
++    *rest = equal(tok, ")") ? tok->next : tok->next->next;
+     return func_type(ty);
+   }
+ 
+@@ -1458,7 +1464,7 @@
+     return cur;
+   }
+ 
+-  if (ty->kind == TY_DOUBLE) {
++  if (ty->kind == TY_DOUBLE || ty->kind == TY_LDOUBLE) {
+     *(double *)(buf + offset) = eval_double(init->expr);
+     return cur;
+   }
+@@ -1598,8 +1604,8 @@
+       error_tok(tok, "stray case");
+ 
+     Node *node = new_node(ND_CASE, tok);
+-    int begin = const_expr(&tok, tok->next);
+-    int end;
++    int64_t begin = const_expr(&tok, tok->next);
++    int64_t end;
+ 
+     if (equal(tok, "...")) {
+       // [GNU] Case ranges, e.g. "case 1 ... 5:"
+@@ -2575,7 +2581,7 @@
+       mem->align = attr.align ? attr.align : mem->ty->align;
+ 
+       if (consume(&tok, tok, ":")) {
+-        mem->is_bitfield = true;
++        error_tok(tok, "bitfields are not supported by the wasm backend");
+         mem->bit_width = const_expr(&tok, tok);
+       }
+ 
+@@ -3233,13 +3239,14 @@
+   // A buffer for a struct/union return value is passed
+   // as the hidden first parameter.
+   Type *rty = ty->return_ty;
+-  if ((rty->kind == TY_STRUCT || rty->kind == TY_UNION) && rty->size > 16)
++  if ((rty->kind == TY_STRUCT || rty->kind == TY_UNION) && (!opt_x86 || rty->size > 16))
+     new_lvar("", pointer_to(rty));
+ 
+   fn->params = locals;
+ 
+   if (ty->is_variadic)
+-    fn->va_area = new_lvar("__va_area__", array_of(ty_char, 136));
++    fn->va_area = opt_x86 ? new_lvar("__va_area__", array_of(ty_char, 136))
++                          : new_lvar("__va_area__", pointer_to(ty_char));
+   fn->alloca_bottom = new_lvar("__alloca_size__", pointer_to(ty_char));
+ 
+   tok = skip(tok, "{");
+@@ -3334,11 +3341,22 @@
+ }
+ 
+ // program = (typedef | function-definition | global-variable)*
++StringArray toplevel_asm;
++
+ Obj *parse(Token *tok) {
+   declare_builtin_functions();
+   globals = NULL;
+ 
+   while (tok->kind != TK_EOF) {
++    // file-scope asm("...") (used by the no-libc host for _start and the syscall stub)
++    if (equal(tok, "asm") || equal(tok, "__asm__")) {
++      tok = skip(tok->next, "(");
++      if (tok->kind != TK_STR) error_tok(tok, "expected string literal");
++      strarray_push(&toplevel_asm, tok->str);
++      tok = skip(skip(tok->next, ")"), ";");
++      continue;
++    }
++
+     VarAttr attr = {};
+     Type *basety = declspec(&tok, tok, &attr);
+ 
+--- /home/exedev/src/chibicc/type.c	2026-09-04 17:10:36.846273790 +0000
++++ cc/type.c	2026-09-04 20:43:31.768134873 +0000
+@@ -6,16 +6,28 @@
+ Type *ty_char = &(Type){TY_CHAR, 1, 1};
+ Type *ty_short = &(Type){TY_SHORT, 2, 2};
+ Type *ty_int = &(Type){TY_INT, 4, 4};
+-Type *ty_long = &(Type){TY_LONG, 8, 8};
++Type *ty_long = &(Type){TY_LONG, 4, 4};
++Type *ty_llong = &(Type){TY_LONG, 8, 8};
+ 
+ Type *ty_uchar = &(Type){TY_CHAR, 1, 1, true};
+ Type *ty_ushort = &(Type){TY_SHORT, 2, 2, true};
+ Type *ty_uint = &(Type){TY_INT, 4, 4, true};
+-Type *ty_ulong = &(Type){TY_LONG, 8, 8, true};
++Type *ty_ulong = &(Type){TY_LONG, 4, 4, true};
++Type *ty_ullong = &(Type){TY_LONG, 8, 8, true};
+ 
+ Type *ty_float = &(Type){TY_FLOAT, 4, 4};
+ Type *ty_double = &(Type){TY_DOUBLE, 8, 8};
+-Type *ty_ldouble = &(Type){TY_LDOUBLE, 16, 16};
++Type *ty_ldouble = &(Type){TY_LDOUBLE, 8, 8};
++
++static int ptr_size = 4;
++
++// x86-64 target: long and pointers are 8 bytes, long double is the 16-byte x87 type
++void set_target_lp64(void) {
++  ty_long->size = ty_long->align = 8;
++  ty_ulong->size = ty_ulong->align = 8;
++  ty_ldouble->size = ty_ldouble->align = 16;
++  ptr_size = 8;
++}
+ 
+ static Type *new_type(TypeKind kind, int size, int align) {
+   Type *ty = calloc(1, sizeof(Type));
+@@ -58,7 +70,7 @@
+   case TY_SHORT:
+   case TY_INT:
+   case TY_LONG:
+-    return t1->is_unsigned == t2->is_unsigned;
++    return t1->is_unsigned == t2->is_unsigned && t1->size == t2->size;
+   case TY_FLOAT:
+   case TY_DOUBLE:
+   case TY_LDOUBLE:
+@@ -95,7 +107,7 @@
+ }
+ 
+ Type *pointer_to(Type *base) {
+-  Type *ty = new_type(TY_PTR, 8, 8);
++  Type *ty = new_type(TY_PTR, ptr_size, ptr_size);
+   ty->base = base;
+   ty->is_unsigned = true;
+   return ty;
+@@ -117,7 +129,7 @@
+ }
+ 
+ Type *vla_of(Type *base, Node *len) {
+-  Type *ty = new_type(TY_VLA, 8, 8);
++  Type *ty = new_type(TY_VLA, ptr_size, ptr_size);
+   ty->base = base;
+   ty->vla_len = len;
+   return ty;
+--- /home/exedev/src/chibicc/preprocess.c	2026-09-04 17:10:36.846273790 +0000
++++ cc/preprocess.c	2026-09-04 20:44:18.887559092 +0000
+@@ -1059,20 +1059,31 @@
+ 
+ void init_macros(void) {
+   // Define predefined macros
+-  define_macro("_LP64", "1");
+   define_macro("__C99_MACRO_WITH_VA_ARGS", "1");
+-  define_macro("__ELF__", "1");
+-  define_macro("__LP64__", "1");
+-  define_macro("__SIZEOF_DOUBLE__", "8");
+-  define_macro("__SIZEOF_FLOAT__", "4");
+-  define_macro("__SIZEOF_INT__", "4");
+-  define_macro("__SIZEOF_LONG_DOUBLE__", "8");
+-  define_macro("__SIZEOF_LONG_LONG__", "8");
+-  define_macro("__SIZEOF_LONG__", "8");
+-  define_macro("__SIZEOF_POINTER__", "8");
+-  define_macro("__SIZEOF_PTRDIFF_T__", "8");
+-  define_macro("__SIZEOF_SHORT__", "2");
+-  define_macro("__SIZEOF_SIZE_T__", "8");
++  if (opt_x86) {
++    define_macro("__LP64__", "1");
++    define_macro("_LP64", "1");
++    define_macro("__x86_64__", "1");
++    define_macro("__x86_64", "1");
++    define_macro("__amd64__", "1");
++    define_macro("__SIZEOF_LONG__", "8");
++    define_macro("__SIZEOF_POINTER__", "8");
++    define_macro("__SIZEOF_PTRDIFF_T__", "8");
++    define_macro("__SIZEOF_SIZE_T__", "8");
++    define_macro("__SIZEOF_LONG_DOUBLE__", "16");
++  } else {
++    define_macro("__ILP32__", "1");
++    define_macro("__wasm__", "1");
++    define_macro("__wasm32__", "1");
++    define_macro("__SIZEOF_LONG__", "4");
++    define_macro("__SIZEOF_POINTER__", "4");
++    define_macro("__SIZEOF_PTRDIFF_T__", "4");
++    define_macro("__SIZEOF_SIZE_T__", "4");
++    }
++  define_macro("__LITTLE_ENDIAN__", "1");
++  define_macro("__ORDER_LITTLE_ENDIAN__", "1234");
++  define_macro("__ORDER_BIG_ENDIAN__", "4321");
++  define_macro("__BYTE_ORDER__", "1234");
+   define_macro("__SIZE_TYPE__", "unsigned long");
+   define_macro("__STDC_HOSTED__", "1");
+   define_macro("__STDC_NO_COMPLEX__", "1");
+@@ -1082,23 +1093,12 @@
+   define_macro("__STDC__", "1");
+   define_macro("__USER_LABEL_PREFIX__", "");
+   define_macro("__alignof__", "_Alignof");
+-  define_macro("__amd64", "1");
+-  define_macro("__amd64__", "1");
+   define_macro("__chibicc__", "1");
+   define_macro("__const__", "const");
+-  define_macro("__gnu_linux__", "1");
+   define_macro("__inline__", "inline");
+-  define_macro("__linux", "1");
+-  define_macro("__linux__", "1");
+   define_macro("__signed__", "signed");
+   define_macro("__typeof__", "typeof");
+-  define_macro("__unix", "1");
+-  define_macro("__unix__", "1");
+   define_macro("__volatile__", "volatile");
+-  define_macro("__x86_64", "1");
+-  define_macro("__x86_64__", "1");
+-  define_macro("linux", "1");
+-  define_macro("unix", "1");
+ 
+   add_builtin("__FILE__", file_macro);
+   add_builtin("__LINE__", line_macro);
+  3235	  locals = NULL;
+  3236	  enter_scope();
+  3237	  create_param_lvars(ty->params);
+  3238	
+  3239	  // A buffer for a struct/union return value is passed
+  3240	  // as the hidden first parameter.
+  3241	  Type *rty = ty->return_ty;
+  3242	  if ((rty->kind == TY_STRUCT || rty->kind == TY_UNION) && (!opt_x86 || rty->size > 16))
+  3243	    new_lvar("", pointer_to(rty));
+  3244	
+  3245	  fn->params = locals;
+  3246	
+  3247	  if (ty->is_variadic)
+  3248	    fn->va_area = opt_x86 ? new_lvar("__va_area__", array_of(ty_char, 136))
+  3249	                          : new_lvar("__va_area__", pointer_to(ty_char));
+  3250	  fn->alloca_bottom = new_lvar("__alloca_size__", pointer_to(ty_char));
+  3251	
+  3252	  tok = skip(tok, "{");
+  3253	
+  3254	  // [https://www.sigbus.info/n1570#6.4.2.2p1] "__func__" is
+  3255	  // automatically defined as a local variable containing the
+  3256	  // current function name.
+  3257	  push_scope("__func__")->var =
+  3258	    new_string_literal(fn->name, array_of(ty_char, strlen(fn->name) + 1));
+  3259	
+  3260	  // [GNU] __FUNCTION__ is yet another name of __func__.
+  3340	  builtin_alloca->is_definition = false;
+  3341	}
+  3342	
+  3343	// program = (typedef | function-definition | global-variable)*
+  3344	StringArray toplevel_asm;
+  3345	
+  3346	Obj *parse(Token *tok) {
+  3347	  declare_builtin_functions();
+  3348	  globals = NULL;
+  3349	
+  3350	  while (tok->kind != TK_EOF) {
+  3351	    // file-scope asm("...") (used by the no-libc host for _start and the syscall stub)
+  3352	    if (equal(tok, "asm") || equal(tok, "__asm__")) {
+  3353	      tok = skip(tok->next, "(");
+  3354	      if (tok->kind != TK_STR) error_tok(tok, "expected string literal");
+  3355	      strarray_push(&toplevel_asm, tok->str);
+  3356	      tok = skip(skip(tok->next, ")"), ";");
+  3357	      continue;
+  3358	    }
+  3359	
+  3360	    VarAttr attr = {};
+  3361	    Type *basety = declspec(&tok, tok, &attr);
+  3362	
+  3363	    // Typedef
+  3364	    if (attr.is_typedef) {
+  3365	      tok = parse_typedef(tok, basety);
+     1	#include "chibicc.h"
+     2	
+     3	Type *ty_void = &(Type){TY_VOID, 1, 1};
+     4	Type *ty_bool = &(Type){TY_BOOL, 1, 1};
+     5	
+     6	Type *ty_char = &(Type){TY_CHAR, 1, 1};
+     7	Type *ty_short = &(Type){TY_SHORT, 2, 2};
+     8	Type *ty_int = &(Type){TY_INT, 4, 4};
+     9	Type *ty_long = &(Type){TY_LONG, 4, 4};
+    10	Type *ty_llong = &(Type){TY_LONG, 8, 8};
+    11	
+    12	Type *ty_uchar = &(Type){TY_CHAR, 1, 1, true};
+    13	Type *ty_ushort = &(Type){TY_SHORT, 2, 2, true};
+    14	Type *ty_uint = &(Type){TY_INT, 4, 4, true};
+    15	Type *ty_ulong = &(Type){TY_LONG, 4, 4, true};
+    16	Type *ty_ullong = &(Type){TY_LONG, 8, 8, true};
+    17	
+    18	Type *ty_float = &(Type){TY_FLOAT, 4, 4};
+    19	Type *ty_double = &(Type){TY_DOUBLE, 8, 8};
+    20	Type *ty_ldouble = &(Type){TY_LDOUBLE, 8, 8};
+    21	
+    22	static int ptr_size = 4;
+    23	
+    24	// x86-64 target: long and pointers are 8 bytes, long double is the 16-byte x87 type
+    25	void set_target_lp64(void) {
+    26	  ty_long->size = ty_long->align = 8;
+    27	  ty_ulong->size = ty_ulong->align = 8;
+    28	  ty_ldouble->size = ty_ldouble->align = 16;
+    29	  ptr_size = 8;
+    30	}
+    31	
+    32	static Type *new_type(TypeKind kind, int size, int align) {
+    33	  Type *ty = calloc(1, sizeof(Type));
+    34	  ty->kind = kind;
+    35	  ty->size = size;
+    36	  ty->align = align;
+    37	  return ty;
+    38	}
+    39	
+    40	bool is_integer(Type *ty) {
+     1	// Driver for the wasm backend: one translation unit in, one .wasm out.
+     2	#include "chibicc.h"
+     3	
+     4	StringArray include_paths;
+     5	bool opt_fpic;
+     6	bool opt_fcommon = false;
+     7	bool opt_x86;
+     8	char *base_file;
+     9	
+    10	static bool opt_E;
+    11	bool opt_S;   // x86: write assembly text instead of an ELF executable (debugging aid)
+    12	static char *opt_o;
+    13	static char *input_path;
+    14	
+    15	bool file_exists(char *path) {
+    16	  struct stat st;
+    17	  return !stat(path, &st);
+    18	}
+    19	
+    20	static void define_arg(char *str) {
+    21	  char *eq = strchr(str, '=');
+    22	  if (eq)
+    23	    define_macro(strndup(str, eq - str), eq + 1);
+    24	  else
+    25	    define_macro(str, "1");
+    26	}
+    27	
+    28	static int parse_num(char *s, long lo, long hi, char *opt) {
+    29	  char *end;
+    30	  errno = 0;
+    31	  long v = strtol(s, &end, 10);
+    32	  if (errno || *end || !*s || v < lo || v > hi)
+    33	    error("%s: expected a number in [%ld, %ld], got \"%s\"", opt, lo, hi, s);
+    34	  return (int)v;
+    35	}
+    36	
+    37	static void usage(int status) {
+    38	  fprintf(stderr, "usage: cc [-E] [-mx86] [-I<dir>] [-D<macro>[=val]] [-mstack=<bytes>] [-mmaxpages=<n>] -o <out> <input.c>\n"
+    39	                  "  default: wasm32 module; -mx86: static x86-64 ELF executable (no libc)\n");
+    40	  exit(status);
+    41	}
+    42	
+    43	static void parse_args(int argc, char **argv) {
+    44	  for (int i = 1; i < argc; i++) {
+    45	    if (!strcmp(argv[i], "-o")) { if (!argv[++i]) usage(1); opt_o = argv[i]; continue; }
+    46	    if (!strncmp(argv[i], "-o", 2)) { opt_o = argv[i] + 2; continue; }
+    47	    if (!strcmp(argv[i], "-E")) { opt_E = true; continue; }
+    48	    if (!strcmp(argv[i], "-I")) { if (!argv[++i]) usage(1); strarray_push(&include_paths, argv[i]); continue; }
+    49	    if (!strncmp(argv[i], "-I", 2)) { strarray_push(&include_paths, argv[i] + 2); continue; }
+    50	    if (!strcmp(argv[i], "-D")) { if (!argv[++i]) usage(1); define_arg(argv[i]); continue; }
+    51	    if (!strncmp(argv[i], "-D", 2)) { define_arg(argv[i] + 2); continue; }
+    52	    if (!strncmp(argv[i], "-mstack=", 8)) { opt_stack_size = parse_num(argv[i] + 8, 16, 1 << 30, "-mstack"); continue; }
+    53	    if (!strncmp(argv[i], "-mmaxpages=", 11)) { opt_max_pages = parse_num(argv[i] + 11, 1, 65536, "-mmaxpages"); continue; }
+    54	    if (!strcmp(argv[i], "-mx86")) { opt_x86 = true; continue; }
+    55	    if (!strcmp(argv[i], "-S")) { opt_S = true; continue; }
+    56	    if (!strcmp(argv[i], "--help")) usage(0);
+    57	    if (argv[i][0] == '-' && argv[i][1]) error("unknown argument: %s", argv[i]);
+    58	    if (input_path) error("only one input file is supported");
+    59	    input_path = argv[i];
+    60	  }
+    61	  if (!input_path) error("no input file");
+    62	}
+    63	
+    64	static void print_tokens(Token *tok) {
+    65	  int line = 1;
+    66	  for (; tok->kind != TK_EOF; tok = tok->next) {
+    67	    if (line > 1 && tok->at_bol) printf("\n");
+    68	    if (tok->has_space && !tok->at_bol) printf(" ");
+    69	    printf("%.*s", tok->len, tok->loc);
+    70	    line++;
+    71	  }
+    72	  printf("\n");
+    73	}
+    74	
+    75	int main(int argc, char **argv) {
+    76	  parse_args(argc, argv);
+    77	  if (opt_x86) set_target_lp64();
+    78	  init_macros();
+    79	  base_file = input_path;
+    80	
+    81	  Token *tok = tokenize_file(input_path);
+    82	  if (!tok) error("%s: %s", input_path, strerror(errno));
+    83	  tok = preprocess(tok);
+    84	
+    85	  if (opt_E) { print_tokens(tok); return 0; }
+    86	
+    87	  Obj *prog = parse(tok);
+    88	  FILE *out = opt_o ? fopen(opt_o, "wb") : stdout;
+    89	  if (!out) error("cannot open output file: %s: %s", opt_o, strerror(errno));
+    90	  if (opt_x86) codegen_x86(prog, out);
+    91	  else codegen(prog, out);
+    92	  fclose(out);
+    93	  return 0;
+    94	}
+  1058	}
+  1059	
+  1060	void init_macros(void) {
+  1061	  // Define predefined macros
+  1062	  define_macro("__C99_MACRO_WITH_VA_ARGS", "1");
+  1063	  if (opt_x86) {
+  1064	    define_macro("__LP64__", "1");
+  1065	    define_macro("_LP64", "1");
+  1066	    define_macro("__x86_64__", "1");
+  1067	    define_macro("__x86_64", "1");
+  1068	    define_macro("__amd64__", "1");
+  1069	    define_macro("__SIZEOF_LONG__", "8");
+  1070	    define_macro("__SIZEOF_POINTER__", "8");
+  1071	    define_macro("__SIZEOF_PTRDIFF_T__", "8");
+  1072	    define_macro("__SIZEOF_SIZE_T__", "8");
+  1073	    define_macro("__SIZEOF_LONG_DOUBLE__", "16");
+  1074	  } else {
+  1075	    define_macro("__ILP32__", "1");
+  1076	    define_macro("__wasm__", "1");
+  1077	    define_macro("__wasm32__", "1");
+  1078	    define_macro("__SIZEOF_LONG__", "4");
+  1079	    define_macro("__SIZEOF_POINTER__", "4");
+  1080	    define_macro("__SIZEOF_PTRDIFF_T__", "4");
+  1081	    define_macro("__SIZEOF_SIZE_T__", "4");
+  1082	    }
+  1083	  define_macro("__LITTLE_ENDIAN__", "1");
+  1084	  define_macro("__ORDER_LITTLE_ENDIAN__", "1234");
+  1085	  define_macro("__ORDER_BIG_ENDIAN__", "4321");
+  1086	  define_macro("__BYTE_ORDER__", "1234");
+  1087	  define_macro("__SIZE_TYPE__", "unsigned long");
+  1088	  define_macro("__STDC_HOSTED__", "1");
+  1089	  define_macro("__STDC_NO_COMPLEX__", "1");
+  1090	  define_macro("__STDC_UTF_16__", "1");
+  1091	  define_macro("__STDC_UTF_32__", "1");
+  1092	  define_macro("__STDC_VERSION__", "201112L");
+  1093	  define_macro("__STDC__", "1");
+  1094	  define_macro("__USER_LABEL_PREFIX__", "");
+  1095	  define_macro("__alignof__", "_Alignof");
+  1096	  define_macro("__chibicc__", "1");
+  1097	  define_macro("__const__", "const");
+  1098	  define_macro("__inline__", "inline");
+  1099	  define_macro("__signed__", "signed");
+  1100	  define_macro("__typeof__", "typeof");
+  1101	  define_macro("__volatile__", "volatile");
+  1102	
+
+exec
+/bin/bash -lc "sed -n '1,160p' tests/run-x86.sh; sed -n '1,180p' tests/asm-diff.sh; stat -c '%a %n' build/control; rg -n 'chmod|assemble_elf' . --glob '"'!reviews/*'"'" in /home/exedev/sandbox-stack
+ succeeded in 0ms:
+#!/bin/sh
+# Differential test of the host compiler: for every guest that has a tcc-built sandbox
+# (probes and adversarial modules), build the same host+guest with chibicc's x86-64 backend
+# and require identical stdout and exit code on the same input.
+cd "$(dirname "$0")/.." || exit 1
+fail=0; n=0
+for dir in build/cat build/rot13 build/evil build/grow build/escape build/adv/*; do
+  [ -f $dir/guest.c ] && [ -x $dir/sandbox ] || continue
+  name=${dir#build/}; out=build/x86/$name; mkdir -p $out
+  printf '#include "host/main.c"\n#include "%s/guest.c"\n' $dir > $out/host.c
+  if ! ./build/chibicc-wasm -mx86 -I. -Irt -I$dir -DARENA_PAGES=256 -o $out/sandbox $out/host.c; then echo "FAIL x86/$name (compile)"; fail=1; continue; fi
+  chmod +x $out/sandbox
+  printf 'Hello, World\n' | $dir/sandbox > $out/tcc.out 2>&1; a=$?
+  printf 'Hello, World\n' | $out/sandbox > $out/x86.out 2>&1; b=$?
+  n=$((n+1))
+  if [ $a -eq $b ] && cmp -s $out/tcc.out $out/x86.out; then echo "PASS x86/$name (exit $a, same output as tcc host)"; else echo "FAIL x86/$name (tcc exit $a, chibicc exit $b)"; diff $out/tcc.out $out/x86.out | head -3; fail=1; fi
+done
+echo "x86 host differential: $n cases"; [ $fail -eq 0 ] && echo "=== ALL PASS ===" ; exit $fail
+#!/bin/sh
+# Developer check (needs binutils, not part of the TCB): assemble chibicc's x86 text with GNU as and
+# compare the normalised disassembly with what cc/asm.c produced. $1 = TU, $2.. = -I flags.
+set -e
+cd "$(dirname "$0")/.."
+TU=$1; shift
+T=$(mktemp -d)
+./build/chibicc-wasm -mx86 -S "$@" -o $T/a.s $TU
+./build/chibicc-wasm -mx86 "$@" -o $T/a.elf $TU
+as -o $T/ref.o $T/a.s
+objcopy -O binary -j .text $T/ref.o $T/ref.bin
+python3 - $T/a.elf $T/mine.bin <<'PY'
+import struct, sys
+d=open(sys.argv[1],'rb').read(); phoff=struct.unpack_from('<Q',d,32)[0]
+p=struct.unpack_from('<IIQQQQQQ',d,phoff); open(sys.argv[2],'wb').write(d[0x1000:p[5]])
+PY
+norm() { objdump -D -b binary -m i386:x86-64 "$1" | grep -E '^\s+[0-9a-f]+:' | sed -E 's/^\s*[0-9a-f]+:\s*//; s/^([0-9a-f]{2} )+\s*//; s/0x[0-9a-f]+/N/g; s/-N/N/g; s/#.*//; s/\s+$//; s/^mov    N\(%rip\),%rax$/lea    N(%rip),%rax/'; }
+norm $T/mine.bin > $T/mine.norm; norm $T/ref.bin > $T/ref.norm
+echo "instructions: mine $(wc -l < $T/mine.norm), as $(wc -l < $T/ref.norm)"
+if diff $T/mine.norm $T/ref.norm > $T/diff.txt; then echo "asm-diff: IDENTICAL instruction streams"; else echo "asm-diff: DIFFERENCES:"; head -20 $T/diff.txt; exit 1; fi
+rm -rf $T
+755 build/control
+./tests/run-x86.sh:12:  chmod +x $out/sandbox
+./cc/chibicc.h:415:void assemble_elf(char *asm_text, FILE *out);
+./cc/asm.c:565:void assemble_elf(char *asm_text, FILE *out) {
+./cc/codegen_x86.c:1598:  assemble_elf(asm_buf, out);
+./Makefile:98:	chmod +x $@
+./tools/fixpoint.sh:12:    ./build/chibicc-wasm -mx86 -I. -Irt -I$1 -DARENA_PAGES=4096 -o $2 $1/host_tu.c && chmod +x $2
+

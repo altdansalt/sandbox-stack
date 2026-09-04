@@ -2,18 +2,12 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <limits.h>
-#if HAS_UNISTD
 #include <unistd.h>
-#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
 #endif
-#if HAS_GETOPT
-  #include <getopt.h>
-#else
   #include "getopt_impl.h"
-#endif /* HAS_GETOPT */
 
 #include "buffer.h"
 #include "file.h"
@@ -21,26 +15,11 @@
 #include "c.h"
 #include "compat.h"
 
-#if HAS_PTHREAD
-static char* const optString = "t:f:d:r:pgmch";
-#else
 static char* const optString = "f:d:r:pgmch";
-#endif /* HAS_PTHREAD */
 
-#if HAS_GLOB
-#include <glob.h>
-#endif /* HAS_GLOB */
 
-#if HAS_UNISTD
 #include <unistd.h>
-#endif /* HAS_UNISTD */
-#if _WIN32
-#include <direct.h>
-#endif
 
-#if _WIN32
-#include <windows.h>
-#endif
 
 static
 bool
@@ -206,36 +185,10 @@ cleanImplementationFiles(void) {
     bool allDigits = true;
     size_t pathLength = 0;
 
-#if HAS_GLOB
-    glob_t globbuf;
-    size_t pathIndex = 0;
-    const int globResult = glob("*.c", GLOB_NOSORT, NULL, &globbuf);
-    if (globResult != 0) {
-        if (globResult != GLOB_NOMATCH) {
-            fprintf(stderr, "w2c2: failed to glob files to clean\n");
-        }
-        return;
-    }
-
-    for (; pathIndex < globbuf.gl_pathc; pathIndex++) {
-        path = globbuf.gl_pathv[pathIndex];
-#elif _WIN32
-    WIN32_FIND_DATA findFileData;
-    const HANDLE hFind = FindFirstFile("*.c", &findFileData);
-    if (hFind == INVALID_HANDLE_VALUE) {
-        if (GetLastError() != ERROR_FILE_NOT_FOUND) {
-            fprintf(stderr, "w2c2: failed to find files to clean\n");
-        }
-        return;
-    }
-    do {
-        path = findFileData.cFileName;
-#else
     /* patched: no directory listing available (wasm guest); nothing to clean */
     (void)path; (void)pathCharIndex; (void)allDigits; (void)pathLength;
     return;
     while (0) {
-#endif
         pathCharIndex = 0;
         allDigits = true;
 
@@ -265,15 +218,7 @@ cleanImplementationFiles(void) {
             fprintf(stderr, "w2c2: failed to remove file %s\n", path);
         }
     }
-#if _WIN32
-    while (FindNextFile(hFind, &findFileData) != 0);
-#endif
 
-#if HAS_GLOB
-    globfree(&globbuf);
-#elif _WIN32
-    FindClose(hFind);
-#endif
 }
 
 static
@@ -318,12 +263,6 @@ main(
 
     while ((c = getopt(argc, argv, optString)) != -1) {
         switch (c) {
-#if HAS_PTHREAD
-            case 't': {
-                threadCount = (U32) strtoul(optarg, NULL, 0);
-                break;
-            }
-#endif /* HAS_PTHREAD */
             case 'f': {
                 functionsPerFile = (U32) strtoul(optarg, NULL, 0);
                 break;
@@ -394,9 +333,6 @@ main(
                     "\n"
                     "options:\n"
                     "  -h         Print this help message\n"
-#if HAS_PTHREAD
-                    "  -t N       Number of threads\n"
-#endif /* HAS_PTHREAD */
                     "  -f N       Number of functions per file. 0 (default) writes all functions into one file\n"
                     "  -d MODE    Data segment mode. Default: arrays. Use 'help' to print available modes\n"
                     "  -g         Generate debug information (function names using asm(); #line directives based on DWARF, if available)\n"
@@ -423,15 +359,6 @@ main(
         }
     }
 
-#if HAS_PTHREAD
-    if (threadCount < 1) {
-#ifdef _SC_NPROCESSORS_ONLN
-        threadCount = (U32) sysconf(_SC_NPROCESSORS_ONLN);
-#else
-        threadCount = 1;
-#endif
-    }
-#endif /* HAS_PTHREAD */
 
     index = optind;
 
