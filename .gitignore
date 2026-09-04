@@ -1,0 +1,7 @@
+build/
+.venv/
+site/
+.serve.log
+.apt.log
+w2c2/*.o
+w2c2/w2c2
