@@ -1060,23 +1060,30 @@ static char *format_time(struct tm *tm) {
 void init_macros(void) {
   // Define predefined macros
   define_macro("__C99_MACRO_WITH_VA_ARGS", "1");
-  define_macro("__ILP32__", "1");
+  if (opt_x86) {
+    define_macro("__LP64__", "1");
+    define_macro("_LP64", "1");
+    define_macro("__x86_64__", "1");
+    define_macro("__x86_64", "1");
+    define_macro("__amd64__", "1");
+    define_macro("__SIZEOF_LONG__", "8");
+    define_macro("__SIZEOF_POINTER__", "8");
+    define_macro("__SIZEOF_PTRDIFF_T__", "8");
+    define_macro("__SIZEOF_SIZE_T__", "8");
+    define_macro("__SIZEOF_LONG_DOUBLE__", "16");
+  } else {
+    define_macro("__ILP32__", "1");
+    define_macro("__wasm__", "1");
+    define_macro("__wasm32__", "1");
+    define_macro("__SIZEOF_LONG__", "4");
+    define_macro("__SIZEOF_POINTER__", "4");
+    define_macro("__SIZEOF_PTRDIFF_T__", "4");
+    define_macro("__SIZEOF_SIZE_T__", "4");
+    }
   define_macro("__LITTLE_ENDIAN__", "1");
   define_macro("__ORDER_LITTLE_ENDIAN__", "1234");
   define_macro("__ORDER_BIG_ENDIAN__", "4321");
   define_macro("__BYTE_ORDER__", "1234");
-  define_macro("__wasm__", "1");
-  define_macro("__wasm32__", "1");
-  define_macro("__SIZEOF_DOUBLE__", "8");
-  define_macro("__SIZEOF_FLOAT__", "4");
-  define_macro("__SIZEOF_INT__", "4");
-  define_macro("__SIZEOF_LONG_DOUBLE__", "8");
-  define_macro("__SIZEOF_LONG_LONG__", "8");
-  define_macro("__SIZEOF_LONG__", "4");
-  define_macro("__SIZEOF_POINTER__", "4");
-  define_macro("__SIZEOF_PTRDIFF_T__", "4");
-  define_macro("__SIZEOF_SHORT__", "2");
-  define_macro("__SIZEOF_SIZE_T__", "4");
   define_macro("__SIZE_TYPE__", "unsigned long");
   define_macro("__STDC_HOSTED__", "1");
   define_macro("__STDC_NO_COMPLEX__", "1");

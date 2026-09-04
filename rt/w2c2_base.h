@@ -10,6 +10,9 @@
  * Only wasm32, little-endian hosts. */
 #ifndef W2C2_BASE_H
 #define W2C2_BASE_H
+#ifdef __chibicc__
+#define __attribute__(x)
+#endif
 
 typedef unsigned char U8;
 typedef signed char I8;

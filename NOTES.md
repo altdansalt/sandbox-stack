@@ -223,3 +223,48 @@ Request: `reviews/request-2.md`; report: `reviews/codex-review-2.md`. Seven find
 Codex found no problems in the cast/narrow rules, signedness of div/rem/shift/compare, struct-return and struct-parameter ABI, varargs, switch fallthrough, loop/continue nesting, `$sp` restore on return, short-circuit blocks, section encoding, or hash-order determinism. `tests/cc/varargs.c` and `switchfall.c` pin those down anyway.
 
 After the fixes the Experiment 3 fixpoint was re-run from scratch (rot13 and self, sandbox and wazero, gen-2): unchanged, byte-identical. `make test`: all pass. TCB: 45,735 lines / 490,402 tokens; tokens changed vs upstream chibicc: 20,706 removed, 14,297 added.
+
+## Experiment 4: tcc out of the TCB (done, verified)
+
+### What was built
+The host side (the no-libc `host/main.c` plus the w2c2-generated C) is now compiled by chibicc's own x86-64 backend, so one compiler front end with two backends replaces both clang and tcc.
+- `cc/codegen_x86.c`: upstream chibicc's x86-64 codegen, almost verbatim (301 tokens added, 183 removed): it prints into a buffer instead of a FILE, drops `.loc` lines, appends file-scope `asm` blocks, and hands the text to the assembler. No binutils anywhere.
+- `cc/asm.c` (633 lines, new): a two-pass assembler for exactly the GNU-syntax subset chibicc emits (about 30 integer mnemonics, the movs/movz family, setcc/jcc, push/pop, scalar SSE, `rep stosb`, `syscall`, `hlt`) and a static ELF64 writer (two PT_LOAD segments, no sections, no relocations, entry `_start`). Every symbol resolves inside the image; `sym@GOTPCREL(%rip)` is encoded as `lea sym(%rip)`. Unknown instructions, x87 (long double), TLS and atomics are errors.
+- Target selection: `-mx86` flips the front end to LP64 (`set_target_lp64`: 8-byte long/pointers, 16-byte long double), selects LP64 predefined macros, the x86 struct-return rule (hidden pointer only above 16 bytes) and the 136-byte x87-style `__va_area__`; wasm stays ILP32. `parse.c` gained file-scope `asm("...")` (used by the host for `_start` and the syscall stub, since chibicc has no asm operand constraints). `host/main.c` has a `__chibicc__` branch for those two pieces.
+- Build: `build/x86/<guest>/sandbox` = `chibicc-wasm -mx86 -I. -Irt -Ibuild/<guest> -o sandbox host_tu.c` where the TU is `#include "host/main.c"` + the generated `guest.c`. Compile time for the 1.36 MB w2c2 guest: 2.5 s.
+
+### Verification
+| check | result |
+|---|---|
+| cat, rot13, evil, grow, escape with the chibicc-compiled host | identical stdout and exit codes to the tcc-compiled hosts (`tests/run-x86.sh`) |
+| five adversarial modules (OOB load, memory.init source OOB, element segment OOB, call_indirect type mismatch, positive control) | identical traps/exit codes to the tcc hosts |
+| escape demo host (`-DDEMO_ESCAPE`, issues getpid) | SIGKILL, as with tcc |
+| strace of a rot13 run | `execve, prctl, read, write, read, exit`, unchanged |
+| w2c2 compiled by chibicc-wasm, hosted by chibicc-x86, translating rot13.wasm and itself | byte-identical to native w2c2 and to wazero; gen-2 (the sandboxed translator's own output for itself, compiled by chibicc-x86) is binary-identical |
+| same with the clang-built w2c2.wasm | byte-identical |
+| assembler differential against GNU `as` (`tests/asm-diff.sh`, developer-only, binutils not in TCB) | 994,926 instructions for the w2c2 host TU: identical instruction streams (the only difference by construction is GOTPCREL `mov` → `lea`, which the check maps as equivalent) |
+
+Timing: sandboxed self-translation takes 17.6 s with the chibicc-compiled host (3.4 s with tcc, 0.21 s when both stages were clang -O2). Two layers of unoptimised codegen; irrelevant for the measurement.
+
+### Sharp edges found
+- `hlt` in user mode raises SIGSEGV with `si_code=SI_KERNEL`; that was the symptom of my first bug (a GOTPCREL `mov` encoded as a real load, so `call *%r10` jumped into `sys3`'s instruction bytes and returned into `_start`'s `hlt`). `strace -i` gives the faulting IP without a debugger.
+- chibicc rejects `void f(T) __attribute__((noreturn))`-style prototypes when `__attribute__` is not defined away; the runtime header now defines it away under `__chibicc__`, as the libc headers already did.
+- My ELF has no section headers, so `objdump -d` shows nothing; disassemble the raw text with `objdump -D -b binary -m i386:x86-64 --adjust-vma`.
+- `"\x7fELF"` in C swallows the following `E` as a hex digit; use octal.
+- The C89 output of w2c2 exercises only: mov/lea/push/pop/movsxd/add/sub/cmp/and/or/xor/shl/shr/sar/neg/imul/div/setcc/jmp/je/jne/jbe/call/ret/rep stosb. The scalar SSE support is untested by these inputs (no float arithmetic in the translator); it is written from the manual and encodes identically to `as` on the cast-table snippets only where those appear.
+
+### Measurement (Experiment 4)
+| component | files | code lines | comment lines | tokens (o200k_base) | bytes |
+|---|---:|---:|---:|---:|---:|
+| w2c2 core (vendored, patched; excludes tests and upstream w2c2_base.h) | 45 | 12090 | 353 | 97775 | 407730 |
+| w2c2 runtime header (rt/w2c2_base.h, rewritten) | 1 | 182 | 18 | 3289 | 9673 |
+| tcc (x86_64 Linux build inputs, commit 62c30a4a) | 20 | 27008 | 3126 | 315053 | 1055247 |
+| minimal libc (libc/) | 16 | 449 | 17 | 5908 | 18188 |
+| host (host/main.c) | 1 | 65 | 5 | 1087 | 3034 |
+| chibicc (cc/: front end, wasm backend, x86-64 backend, assembler, ELF writer) | 12 | 7837 | 840 | 94146 | 288634 |
+| **total with tcc as host compiler** | | **47631** | | **517258** | |
+| **total with chibicc x86-64 as host compiler (tcc excluded)** | | **20623** | | **202205** | |
+
+Tokens changed versus upstream chibicc: 20,964 removed, 26,582 added (of which `asm.c` is 11,379 new and `codegen_x86.c` differs by 301/183).
+
+So the complete trusted source for "C text in, stdin→stdout process out" is now **20,623 code lines / 202,205 tokens**: w2c2 (48%), chibicc with both backends and the assembler (47%), and 5% for the runtime header, libc and host. clang, tcc, binutils and every libc are outside the boundary; the kernel is excluded by the brief. Remaining levers, not started: prune w2c2 (`debug.c`, threads, WASI, multi-module: probably a third of it) and drop the wasm backend's unused float paths.

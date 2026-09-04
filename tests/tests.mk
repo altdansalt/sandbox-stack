@@ -27,3 +27,9 @@ test: test-cc
 test-cc: build/chibicc-wasm build/control
 	./tests/cc/run.sh
 .PHONY: test-cc
+
+# host compiled by chibicc's x86-64 backend instead of tcc (Experiment 4)
+test: test-x86
+test-x86: build/chibicc-wasm all $(ADV:%=build/adv/%/sandbox)
+	./tests/run-x86.sh
+.PHONY: test-x86

@@ -17,11 +17,17 @@ const U32 wasm_table_arena_size = TABLE_SIZE;
 
 enum { SYS_read = 0, SYS_write = 1, SYS_exit = 60, SYS_prctl = 157, PR_SET_SECCOMP = 22, SECCOMP_MODE_STRICT = 1 };
 
+#ifdef __chibicc__
+/* chibicc has no operand constraints: the syscall stub is a plain asm function */
+long sys3(long n, long a, long b, long c);
+__asm__(".globl sys3\nsys3:\n mov %rdi, %rax\n mov %rsi, %rdi\n mov %rdx, %rsi\n mov %rcx, %rdx\n syscall\n ret\n");
+#else
 static long sys3(long n, long a, long b, long c) {
     long r;
     __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
     return r;
 }
+#endif
 /* exit, not exit_group: strict seccomp kills on exit_group, which is what libc's exit() uses */
 static void NORETURN sys_exit(int code) { for (;;) sys3(SYS_exit, code, 0, 0); }
 

@@ -19,6 +19,16 @@ Type *ty_float = &(Type){TY_FLOAT, 4, 4};
 Type *ty_double = &(Type){TY_DOUBLE, 8, 8};
 Type *ty_ldouble = &(Type){TY_LDOUBLE, 8, 8};
 
+static int ptr_size = 4;
+
+// x86-64 target: long and pointers are 8 bytes, long double is the 16-byte x87 type
+void set_target_lp64(void) {
+  ty_long->size = ty_long->align = 8;
+  ty_ulong->size = ty_ulong->align = 8;
+  ty_ldouble->size = ty_ldouble->align = 16;
+  ptr_size = 8;
+}
+
 static Type *new_type(TypeKind kind, int size, int align) {
   Type *ty = calloc(1, sizeof(Type));
   ty->kind = kind;
@@ -97,7 +107,7 @@ Type *copy_type(Type *ty) {
 }
 
 Type *pointer_to(Type *base) {
-  Type *ty = new_type(TY_PTR, 4, 4);
+  Type *ty = new_type(TY_PTR, ptr_size, ptr_size);
   ty->base = base;
   ty->is_unsigned = true;
   return ty;
@@ -119,7 +129,7 @@ Type *array_of(Type *base, int len) {
 }
 
 Type *vla_of(Type *base, Node *len) {
-  Type *ty = new_type(TY_VLA, 4, 4);
+  Type *ty = new_type(TY_VLA, ptr_size, ptr_size);
   ty->base = base;
   ty->vla_len = len;
   return ty;

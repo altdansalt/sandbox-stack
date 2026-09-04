@@ -86,3 +86,16 @@ build/cc/w2c2.wasm: build/cc/w2c2.c build/chibicc-wasm $(wildcard w2c2/*.h) $(wi
 
 exp3-guests: $(GUESTS:%=build/cc/%/sandbox)
 .PHONY: exp3-guests
+
+# ---- Experiment 4: host side compiled by chibicc's x86-64 backend (no tcc) ----
+# one TU: host/main.c + the w2c2-generated guest.c
+build/x86/%/host.c: build/%/guest.c
+	@mkdir -p build/x86/$*
+	printf '#include "host/main.c"\n#include "%s"\n' $< > $@
+
+build/x86/%/sandbox: build/x86/%/host.c build/chibicc-wasm host/main.c rt/w2c2_base.h
+	./build/chibicc-wasm -mx86 -I. -Irt -Ibuild/$* -DARENA_PAGES=$(ARENA_PAGES) -o $@ $< || (rm -f $@; false)
+	chmod +x $@
+
+exp4-guests: $(GUESTS:%=build/x86/%/sandbox)
+.PHONY: exp4-guests

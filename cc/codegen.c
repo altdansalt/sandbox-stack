@@ -903,6 +903,7 @@ static void emit_data(Obj *prog, Buf *sec) {
 int align_to(int n, int align) { return (n + align - 1) / align * align; }
 
 void codegen(Obj *prog, FILE *out) {
+  if (toplevel_asm.len) error("file-scope asm is not supported by the wasm backend");
   // the parser prepends, so prog is in reverse source order; reverse it for stable numbering
   Obj *rev = NULL;
   for (Obj *o = prog; o;) { Obj *next = o->next; o->next = rev; rev = o; o = next; }

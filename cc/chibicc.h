@@ -411,8 +411,14 @@ void add_type(Node *node);
 //
 
 void codegen(Obj *prog, FILE *out);
+void codegen_x86(Obj *prog, FILE *out);
+void assemble_elf(char *asm_text, FILE *out);
 extern int opt_stack_size;
 extern int opt_max_pages;
+extern bool opt_x86;          // target: x86-64 static ELF (LP64) instead of wasm32 (ILP32)
+extern StringArray toplevel_asm;
+extern bool opt_S;
+void set_target_lp64(void);
 int align_to(int n, int align);
 
 //

@@ -1,12 +1,20 @@
 #!/bin/sh
-# Fixpoint check for a translator wasm: $1 = w2c2 guest wasm, $2 = tag.
+# Fixpoint check for a translator wasm: $1 = w2c2 guest wasm, $2 = tag, HOSTCC=tcc|chibicc (host compiler).
 # Translates rot13 (cc-built) and the translator itself, in the sandbox and under wazero,
 # and diffs against native w2c2 (build/w2c2-native) on the same inputs.
 set -e
 W=$1; TAG=$2; D=build/fix-$TAG; rm -rf $D; mkdir -p $D/w2c2
 cp $W $D/w2c2/guest.wasm
 ./build/w2c2-native $D/w2c2/guest.wasm $D/w2c2/guest.c 2>/dev/null
-tcc -nostdlib -static -nostdinc -Irt -I$D/w2c2 -DARENA_PAGES=4096 -o $D/sandbox host/main.c $D/w2c2/guest.c
+hostcc() { # $1 = dir with guest.c/guest.h, $2 = output binary
+  if [ "${HOSTCC:-tcc}" = chibicc ]; then
+    printf '#include "host/main.c"\n#include "%s/guest.c"\n' $1 > $1/host_tu.c
+    ./build/chibicc-wasm -mx86 -I. -Irt -I$1 -DARENA_PAGES=4096 -o $2 $1/host_tu.c && chmod +x $2
+  else
+    tcc -nostdlib -static -nostdinc -Irt -I$1 -DARENA_PAGES=4096 -o $2 host/main.c $1/guest.c
+  fi
+}
+hostcc $D/w2c2 $D/sandbox
 for input in build/cc/rot13.wasm $W; do
   name=$(basename $input .wasm); mkdir -p $D/native-$name $D/sbx-$name $D/ctl-$name
   cp $input $D/native-$name/guest.wasm
@@ -19,5 +27,5 @@ for input in build/cc/rot13.wasm $W; do
 done
 # gen-2: compile the C the sandboxed translator produced for itself, compare binaries
 mkdir -p $D/gen2 && cp $D/sbx-$(basename $W .wasm)/guest.c $D/sbx-$(basename $W .wasm)/guest.h $D/gen2/
-tcc -nostdlib -static -nostdinc -Irt -I$D/gen2 -DARENA_PAGES=4096 -o $D/gen2/sandbox host/main.c $D/gen2/guest.c
+hostcc $D/gen2 $D/gen2/sandbox
 cmp $D/gen2/sandbox $D/sandbox && echo "[$TAG] gen-2 sandbox binary identical to gen-1"

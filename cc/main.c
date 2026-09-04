@@ -3,10 +3,12 @@
 
 StringArray include_paths;
 bool opt_fpic;
-bool opt_fcommon = true;
+bool opt_fcommon = false;
+bool opt_x86;
 char *base_file;
 
 static bool opt_E;
+bool opt_S;   // x86: write assembly text instead of an ELF executable (debugging aid)
 static char *opt_o;
 static char *input_path;
 
@@ -33,7 +35,8 @@ static int parse_num(char *s, long lo, long hi, char *opt) {
 }
 
 static void usage(int status) {
-  fprintf(stderr, "usage: cc [-E] [-I<dir>] [-D<macro>[=val]] [-mstack=<bytes>] [-mmaxpages=<n>] -o <out.wasm> <input.c>\n");
+  fprintf(stderr, "usage: cc [-E] [-mx86] [-I<dir>] [-D<macro>[=val]] [-mstack=<bytes>] [-mmaxpages=<n>] -o <out> <input.c>\n"
+                  "  default: wasm32 module; -mx86: static x86-64 ELF executable (no libc)\n");
   exit(status);
 }
 
@@ -48,6 +51,8 @@ static void parse_args(int argc, char **argv) {
     if (!strncmp(argv[i], "-D", 2)) { define_arg(argv[i] + 2); continue; }
     if (!strncmp(argv[i], "-mstack=", 8)) { opt_stack_size = parse_num(argv[i] + 8, 16, 1 << 30, "-mstack"); continue; }
     if (!strncmp(argv[i], "-mmaxpages=", 11)) { opt_max_pages = parse_num(argv[i] + 11, 1, 65536, "-mmaxpages"); continue; }
+    if (!strcmp(argv[i], "-mx86")) { opt_x86 = true; continue; }
+    if (!strcmp(argv[i], "-S")) { opt_S = true; continue; }
     if (!strcmp(argv[i], "--help")) usage(0);
     if (argv[i][0] == '-' && argv[i][1]) error("unknown argument: %s", argv[i]);
     if (input_path) error("only one input file is supported");
@@ -68,8 +73,9 @@ static void print_tokens(Token *tok) {
 }
 
 int main(int argc, char **argv) {
-  init_macros();
   parse_args(argc, argv);
+  if (opt_x86) set_target_lp64();
+  init_macros();
   base_file = input_path;
 
   Token *tok = tokenize_file(input_path);
@@ -81,7 +87,8 @@ int main(int argc, char **argv) {
   Obj *prog = parse(tok);
   FILE *out = opt_o ? fopen(opt_o, "wb") : stdout;
   if (!out) error("cannot open output file: %s: %s", opt_o, strerror(errno));
-  codegen(prog, out);
+  if (opt_x86) codegen_x86(prog, out);
+  else codegen(prog, out);
   fclose(out);
   return 0;
 }

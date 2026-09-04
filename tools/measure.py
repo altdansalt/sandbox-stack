@@ -42,7 +42,9 @@ for name, fn in COMPONENTS:
 print('| component | files | code lines | comment lines | tokens (o200k_base) | bytes |')
 print('|---|---:|---:|---:|---:|---:|')
 for r in rows: print('| %s | %d | %d | %d | %d | %d |' % r)
-print('| **total** | | **%d** | | **%d** | |' % (tl, tt))
+print('| **total (tcc as host compiler)** | | **%d** | | **%d** | |' % (tl, tt))
+tcc_row = [r for r in rows if r[0].startswith('tcc')][0]
+print('| **total (chibicc x86-64 as host compiler, tcc excluded)** | | **%d** | | **%d** | |' % (tl - tcc_row[2], tt - tcc_row[4]))
 
 
 # ---- Experiment 3: tokens changed versus upstream chibicc ----
@@ -54,7 +56,8 @@ print('|---|---:|---:|---:|---:|')
 trem = tadd = 0
 for f in sorted(set(os.listdir(CC_UP)) | set(os.listdir(CC))):
     if not (f.endswith('.c') or f.endswith('.h')): continue
-    a = open(os.path.join(CC_UP, f)).read().splitlines(True) if os.path.exists(os.path.join(CC_UP, f)) else []
+    up = 'codegen.c' if f == 'codegen_x86.c' else f   # our x86 backend is upstream's codegen.c
+    a = open(os.path.join(CC_UP, up)).read().splitlines(True) if os.path.exists(os.path.join(CC_UP, up)) else []
     b = open(os.path.join(CC, f)).read().splitlines(True) if os.path.exists(os.path.join(CC, f)) else []
     if not a and not b: continue
     rem = add = 0

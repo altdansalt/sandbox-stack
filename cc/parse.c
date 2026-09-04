@@ -3239,13 +3239,14 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
   // A buffer for a struct/union return value is passed
   // as the hidden first parameter.
   Type *rty = ty->return_ty;
-  if (rty->kind == TY_STRUCT || rty->kind == TY_UNION)
+  if ((rty->kind == TY_STRUCT || rty->kind == TY_UNION) && (!opt_x86 || rty->size > 16))
     new_lvar("", pointer_to(rty));
 
   fn->params = locals;
 
   if (ty->is_variadic)
-    fn->va_area = new_lvar("__va_area__", pointer_to(ty_char));
+    fn->va_area = opt_x86 ? new_lvar("__va_area__", array_of(ty_char, 136))
+                          : new_lvar("__va_area__", pointer_to(ty_char));
   fn->alloca_bottom = new_lvar("__alloca_size__", pointer_to(ty_char));
 
   tok = skip(tok, "{");
@@ -3340,11 +3341,22 @@ static void declare_builtin_functions(void) {
 }
 
 // program = (typedef | function-definition | global-variable)*
+StringArray toplevel_asm;
+
 Obj *parse(Token *tok) {
   declare_builtin_functions();
   globals = NULL;
 
   while (tok->kind != TK_EOF) {
+    // file-scope asm("...") (used by the no-libc host for _start and the syscall stub)
+    if (equal(tok, "asm") || equal(tok, "__asm__")) {
+      tok = skip(tok->next, "(");
+      if (tok->kind != TK_STR) error_tok(tok, "expected string literal");
+      strarray_push(&toplevel_asm, tok->str);
+      tok = skip(skip(tok->next, ")"), ";");
+      continue;
+    }
+
     VarAttr attr = {};
     Type *basety = declspec(&tok, tok, &attr);
 
