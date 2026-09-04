@@ -565,6 +565,8 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
       ty = ty_double;
       break;
     case LONG + DOUBLE:
+      if (opt_x86)
+        error_tok(tok, "long double is not supported by the x86-64 backend (x87 is not assembled)");
       ty = ty_ldouble;
       break;
     default:
@@ -588,7 +590,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
 static Type *func_params(Token **rest, Token *tok, Type *ty) {
   // wasm backend: an empty parameter list means "no parameters", not
   // "unspecified"; calls with arguments are then rejected as too many.
-  if ((equal(tok, "void") && equal(tok->next, ")")) || equal(tok, ")")) {
+  if ((equal(tok, "void") && equal(tok->next, ")")) || (equal(tok, ")") && !opt_x86)) {
     *rest = equal(tok, ")") ? tok->next : tok->next->next;
     return func_type(ty);
   }
@@ -3350,7 +3352,9 @@ Obj *parse(Token *tok) {
   while (tok->kind != TK_EOF) {
     // file-scope asm("...") (used by the no-libc host for _start and the syscall stub)
     if (equal(tok, "asm") || equal(tok, "__asm__")) {
-      tok = skip(tok->next, "(");
+      tok = tok->next;
+      while (equal(tok, "volatile") || equal(tok, "inline") || equal(tok, "__volatile__")) tok = tok->next;
+      tok = skip(tok, "(");
       if (tok->kind != TK_STR) error_tok(tok, "expected string literal");
       strarray_push(&toplevel_asm, tok->str);
       tok = skip(skip(tok->next, ")"), ";");

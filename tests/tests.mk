@@ -33,3 +33,11 @@ test: test-x86
 test-x86: build/chibicc-wasm all $(ADV:%=build/adv/%/sandbox)
 	./tests/run-x86.sh
 .PHONY: test-x86
+
+# assembler byte-exactness vs GNU as (developer tool) and native x86-64 C tests
+test: test-asm test-x86c
+test-asm: build/chibicc-wasm
+	./tests/asm/run.sh
+test-x86c: build/chibicc-wasm
+	./tests/x86c/run.sh
+.PHONY: test-asm test-x86c

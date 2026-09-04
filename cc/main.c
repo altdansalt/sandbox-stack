@@ -8,6 +8,7 @@ bool opt_x86;
 char *base_file;
 
 static bool opt_E;
+static bool opt_asm;   // input is x86-64 assembly text (assembler tests)
 bool opt_S;   // x86: write assembly text instead of an ELF executable (debugging aid)
 static char *opt_o;
 static char *input_path;
@@ -53,6 +54,7 @@ static void parse_args(int argc, char **argv) {
     if (!strncmp(argv[i], "-mmaxpages=", 11)) { opt_max_pages = parse_num(argv[i] + 11, 1, 65536, "-mmaxpages"); continue; }
     if (!strcmp(argv[i], "-mx86")) { opt_x86 = true; continue; }
     if (!strcmp(argv[i], "-S")) { opt_S = true; continue; }
+    if (!strcmp(argv[i], "-masm")) { opt_asm = opt_x86 = true; continue; }
     if (!strcmp(argv[i], "--help")) usage(0);
     if (argv[i][0] == '-' && argv[i][1]) error("unknown argument: %s", argv[i]);
     if (input_path) error("only one input file is supported");
@@ -78,6 +80,21 @@ int main(int argc, char **argv) {
   init_macros();
   base_file = input_path;
 
+  if (opt_asm) {
+    FILE *in = fopen(input_path, "rb");
+    if (!in) error("%s: %s", input_path, strerror(errno));
+    char *buf = NULL; size_t len = 0, cap = 0; int c;
+    while ((c = fgetc(in)) != EOF) { if (len + 2 > cap) { cap = cap ? cap * 2 : 4096; buf = realloc(buf, cap); } buf[len++] = (char)c; }
+    if (!buf) error("empty input");
+    buf[len] = 0;
+    FILE *out = opt_o ? fopen(opt_o, "wb") : stdout;
+    if (!out) error("cannot open output file: %s: %s", opt_o, strerror(errno));
+    assemble_elf(buf, out);
+    fclose(out);
+    if (opt_o) chmod(opt_o, 0755);
+    return 0;
+  }
+
   Token *tok = tokenize_file(input_path);
   if (!tok) error("%s: %s", input_path, strerror(errno));
   tok = preprocess(tok);
@@ -90,5 +107,6 @@ int main(int argc, char **argv) {
   if (opt_x86) codegen_x86(prog, out);
   else codegen(prog, out);
   fclose(out);
+  if (opt_x86 && !opt_S && opt_o) chmod(opt_o, 0755);
   return 0;
 }

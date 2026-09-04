@@ -271,3 +271,29 @@ So the complete trusted source for "C text in, stdin→stdout process out" is no
 
 ### w2c2 pruning (after Experiment 4)
 `unifdef` removed the thread pool, libdwarf, Windows and libc-fallback regions from the vendored w2c2 (patch 6 in `w2c2/PATCHES.md`). Translator output is byte-identical on rot13.wasm and w2c2.wasm; all fixpoints and tests unchanged. w2c2 core: 12,090 → 11,174 code lines (97,775 → 90,796 tokens). **Total trusted source with chibicc as host compiler: 19,707 code lines / 195,226 tokens.** The remaining w2c2 fat is runtime features we never use (separate compilation, multiple modules, reference-module split with SHA1, pretty printing, Mach-O data segment mode); removing those is manual surgery in c.c, estimated at another 15–20% of w2c2, not started.
+
+## Codex review 3 (assembler, ELF writer, x86 target): findings and fixes
+
+Request: `reviews/request-3.md`; report: `reviews/codex-review-3.md`. Twenty findings. The differential test against GNU `as` had only covered the instruction shapes w2c2's output uses; the review targeted everything else.
+
+| # | severity | finding | action |
+|---|---|---|---|
+| 1 | high | `mov $imm, %r8w..%r15w` emitted REX before the 0x66 prefix (wrote `%ax`) | prefix order fixed; imm forms rewritten |
+| 2 | high | `%ah`-family register in the ModRM.reg field was silently re-encoded as `%spl` etc. when REX was present | `reg_high8` tracked; error on any REX |
+| 3 | high | `movq %xmm, %xmm` encoded as GPR→XMM | separate `F3 0F 7E` form; operand-class checks on all `movq` forms |
+| 4 | high | `#` comments (float literals) broke operand parsing | comments stripped per segment |
+| 5 | high | `1: mov ...` inside `;`-joined cast strings not recognised as a label | label-then-instruction segments supported |
+| 6 | high | `jmp 1b` (alloca loop) unsupported | backward numeric labels resolved to the latest definition |
+| 7 | medium | operand widths/classes not cross-checked (`mov %eax,%rax` accepted) | `same_width`, SSE class checks, exact operand counts, 4th operand rejected |
+| 8, 9 | medium | immediate ranges wrong (`addl $0x80000000` rejected; `mov $-129,%al`, `shl $999` truncated) | `check_imm` per field width; unsigned 32-bit patterns accepted for 32-bit destinations; shift counts bounded |
+| 10 | medium | directives parsed with unchecked `strtol`; `.comm` unvalidated | strict `num()`; `.comm` rejected (never emitted with `opt_fcommon=false`) |
+| 12 | medium | file-scope `asm` rejected `volatile`/`inline` | accepted |
+| 13 | low | output ELF not executable | driver `chmod 0755` |
+| 14 | low | no `PT_GNU_STACK` | third program header, RW |
+| 15 | note | `foo+8(%rip)` treated as a symbol name | rejected explicitly |
+| 16 | medium | `int f();` = no parameters was applied to x86 too (C semantics regression) | wasm-only now; x86 keeps upstream behaviour (`old_style.c`) |
+| 17 | medium | `long double` advertised (16 bytes) but x87 unassemblable; global init wrote 8 bytes | `long double` rejected at parse time on x86 (`long_double_rejected.c`) |
+| 18 | medium | `__SIZEOF_INT__` etc. lost in the macro edit; `__STDC_HOSTED__ 1` | restored; hosted → 0 |
+| 11, 19, 20 | low | covered by 7/10; per-process state not reset | documented (one TU per process) |
+
+New tests, all in `make test`: `tests/asm/cases.s` (181 instructions covering the review's list, byte-identical to GNU `as`), `tests/asm/reject/*.s` (13 inputs that must be rejected), `tests/x86c/*.c` (native x86-64: float literals, u64→double, alloca, old-style declarations, struct/vararg ABI, long double must fail). While writing them: the tokenizer's new range check had to let an out-of-range integer prefix fall through to the float parser (`18446744073709551616.0`), and the x86 target needed upstream chibicc's `stdarg.h` scheme (`libc/include/stdarg.h` now branches on `__x86_64__`). Everything re-verified: full suite, GNU `as` differential on the 1M-instruction w2c2 host TU, both fixpoints. TCB without tcc: **19,829 code lines / 197,361 tokens**.

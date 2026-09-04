@@ -11,12 +11,12 @@
 | Environment (clang+lld wasm32, tcc, go, w2c2, wazero, chibicc, tokei, tiktoken) | done |
 | Exp 1: cat/rot13 through the full pipeline under seccomp-strict | **done, verified** (strace shows only prctl/read/write/exit; disallowed syscall → SIGKILL) |
 | Exp 2: w2c2 compiled to wasm, run inside the sandbox, fixpoint check | **done, verified**: sandboxed w2c2 translating rot13.wasm and w2c2.wasm is byte-identical to native and to wazero; gen-2 translator identical |
-| Measurement table (lines + tokens of the TCB) | Exp 2: 39,651 lines / 421,143 tokens. After codex fixes: 422,730. Exp 3: 490,402 tokens. Exp 4 (clang and tcc both replaced, w2c2 pruned): **19,707 lines / 195,226 tokens** |
+| Measurement table (lines + tokens of the TCB) | Exp 2: 39,651 lines / 421,143 tokens. After codex fixes: 422,730. Exp 3: 490,402 tokens. Exp 4 (clang and tcc both replaced, w2c2 pruned, after review fixes): **19,829 lines / 197,361 tokens** |
 | Exp 3: chibicc → wasm (no clang) | **done, verified**: chibicc-wasm compiles w2c2+libc; that translator reaches the same byte-identical fixpoint in the sandbox; the compiler itself builds with tcc |
 | Exp 4: host compiled by chibicc's x86-64 backend + own assembler/ELF writer (no tcc) | **done, verified**: same fixpoint, same traps, same strace; assembler matches GNU as on 994,926 instructions |
 
 ## What's happening right now
-Experiment 4 is done: the host side is compiled by chibicc's x86-64 backend through a new 633-line assembler and static ELF writer, so neither clang nor tcc is in the trusted set any more. Total trusted source: **19,707 code lines / 195,226 tokens** (was 490k with tcc). A codex review of the assembler and ELF writer is running next.
+Experiment 4 is done: the host side is compiled by chibicc's x86-64 backend through a new 633-line assembler and static ELF writer, so neither clang nor tcc is in the trusted set any more. Total trusted source: **19,829 code lines / 197,361 tokens** (was 490k with tcc). Three codex reviews done; all findings fixed and covered by tests.
 
 ## Findings so far
 - w2c2 upstream has **no memory bounds checks** and `call_indirect` has no table bounds/null/signature check. The runtime header was rewritten (164 lines) to add software checks and a static memory arena. See NOTES.md "Sharp edges".

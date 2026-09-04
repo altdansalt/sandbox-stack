@@ -356,8 +356,11 @@ static bool convert_pp_int(Token *tok) {
 
   errno = 0;
   uint64_t val = strtoull(p, &p, base);
-  if (errno == ERANGE)
+  if (errno == ERANGE) {
+    if (strpbrk(p, ".eEpP") && strpbrk(p, ".eEpP") < tok->loc + tok->len)
+      return false;   // floating-point literal: let the float path parse it
     error_tok(tok, "integer literal is too large");
+  }
 
   // Read U, L or LL suffixes.
   bool l = false;

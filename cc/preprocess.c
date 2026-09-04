@@ -1080,12 +1080,17 @@ void init_macros(void) {
     define_macro("__SIZEOF_PTRDIFF_T__", "4");
     define_macro("__SIZEOF_SIZE_T__", "4");
     }
+  define_macro("__SIZEOF_INT__", "4");
+  define_macro("__SIZEOF_SHORT__", "2");
+  define_macro("__SIZEOF_LONG_LONG__", "8");
+  define_macro("__SIZEOF_FLOAT__", "4");
+  define_macro("__SIZEOF_DOUBLE__", "8");
   define_macro("__LITTLE_ENDIAN__", "1");
   define_macro("__ORDER_LITTLE_ENDIAN__", "1234");
   define_macro("__ORDER_BIG_ENDIAN__", "4321");
   define_macro("__BYTE_ORDER__", "1234");
   define_macro("__SIZE_TYPE__", "unsigned long");
-  define_macro("__STDC_HOSTED__", "1");
+  define_macro("__STDC_HOSTED__", "0");
   define_macro("__STDC_NO_COMPLEX__", "1");
   define_macro("__STDC_UTF_16__", "1");
   define_macro("__STDC_UTF_32__", "1");
